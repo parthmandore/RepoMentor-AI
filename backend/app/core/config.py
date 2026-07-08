@@ -29,12 +29,10 @@ class Settings(BaseSettings):
 
     # CORS Settings
     CORS_ORIGINS: List[str] = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-
-    # Production frontend
-    "https://repo-mentor-ai.vercel.app"
-]
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://repomentor.netlify.app"
+    ]
 
     # Timeout & Retry Settings
     GIT_CLONE_TIMEOUT: int = 120
