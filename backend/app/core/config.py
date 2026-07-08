@@ -28,14 +28,13 @@ class Settings(BaseSettings):
     CLONE_DIR: str = "temp_clones"
 
     # CORS Settings
-    CORS_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost",
-        "http://127.0.0.1",
-        "https://localhost:3000",
-        "https://127.0.0.1:3000"
-    ]
+   CORS_ORIGINS: List[str] = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+
+    # Production frontend
+    "https://repo-mentor-ai.vercel.app"
+]
 
     # Timeout & Retry Settings
     GIT_CLONE_TIMEOUT: int = 120
