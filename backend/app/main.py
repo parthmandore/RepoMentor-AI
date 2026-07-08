@@ -99,4 +99,11 @@ app.include_router(health_router, prefix=settings.API_V1_STR)
 app.include_router(repositories_router, prefix=settings.API_V1_STR)
 
 # Also map health check at root for convenience
-app.include_router(health_router)
+@app.get("/")
+async def root():
+    return {
+        "project": "RepoMentor AI",
+        "status": "Running",
+        "docs": "/docs",
+        "health": "/api/v1/health"
+    }
