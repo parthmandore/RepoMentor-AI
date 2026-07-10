@@ -399,6 +399,29 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             if rf.path in smell_counts_by_file:
                 rf.code_smells_count = smell_counts_by_file[rf.path]
 
+        # Execute bulk updates in a single database batch
+        update_mappings = [
+            {
+                "id": rf.id,
+                "lines_of_code": rf.lines_of_code,
+                "complexity": rf.complexity,
+                "analysis_metadata": rf.analysis_metadata,
+                "module_type": rf.module_type,
+                "outgoing_dependencies": rf.outgoing_dependencies,
+                "incoming_dependencies": rf.incoming_dependencies,
+                "in_dependency_cycle": rf.in_dependency_cycle,
+                "coupling_score": rf.coupling_score,
+                "instability_score": rf.instability_score,
+                "code_smells_count": rf.code_smells_count
+            }
+            for rf in repo_files
+        ]
+        db.bulk_update_mappings(RepositoryFile, update_mappings)
+        
+        # Expunge the ORM objects to prevent sequential dirty-tracked updates on commit
+        for rf in repo_files:
+            db.expunge(rf)
+
         # 3. Calculate Duplication (disabled for portfolio performance)
         duplication_result = {"duplication_percentage": 0.0, "details": []}
 
@@ -451,40 +474,40 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
 
         # 7. Write code smells & security issues to DB
         db.query(CodeSmell).filter(CodeSmell.repository_id == repo_id).delete()
-        smell_records = [
-            CodeSmell(
-                id=uuid.uuid4(),
-                repository_id=repo_id,
-                file_path=smell["file_path"],
-                smell_type=smell["smell_type"],
-                category=smell["category"],
-                severity=smell["severity"],
-                line_number=smell.get("line_number"),
-                measured_value=smell["measured_value"],
-                threshold=smell["threshold"],
-                reason=smell["reason"],
-            )
+        smell_mappings = [
+            {
+                "id": uuid.uuid4(),
+                "repository_id": repo_id,
+                "file_path": smell["file_path"],
+                "smell_type": smell["smell_type"],
+                "category": smell["category"],
+                "severity": smell["severity"],
+                "line_number": smell.get("line_number"),
+                "measured_value": smell["measured_value"],
+                "threshold": smell["threshold"],
+                "reason": smell["reason"]
+            }
             for smell in all_smells
         ]
-        db.bulk_save_objects(smell_records)
+        db.bulk_insert_mappings(CodeSmell, smell_mappings)
 
         db.query(SecurityIssue).filter(SecurityIssue.repository_id == repo_id).delete()
-        sec_records = [
-            SecurityIssue(
-                id=uuid.uuid4(),
-                repository_id=repo_id,
-                file_path=issue["file_path"],
-                line_number=issue["line_number"],
-                severity=issue["severity"],
-                category=issue["category"],
-                title=issue["title"],
-                evidence=issue["evidence"],
-                snippet=issue["snippet"],
-                reason=issue["reason"]
-            )
+        sec_mappings = [
+            {
+                "id": uuid.uuid4(),
+                "repository_id": repo_id,
+                "file_path": issue["file_path"],
+                "line_number": issue["line_number"],
+                "severity": issue["severity"],
+                "category": issue["category"],
+                "title": issue["title"],
+                "evidence": issue["evidence"],
+                "snippet": issue["snippet"],
+                "reason": issue["reason"]
+            }
             for issue in flat_sec_issues
         ]
-        db.bulk_save_objects(sec_records)
+        db.bulk_insert_mappings(SecurityIssue, sec_mappings)
 
         # 8. Build Architecture & Security summary details
         logger.info(f"Building architecture knowledge for repo {repo_id}...")

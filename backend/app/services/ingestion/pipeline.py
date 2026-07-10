@@ -317,19 +317,26 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
 
         # Clear existing file records
         db.query(RepositoryFile).filter(RepositoryFile.repository_id == repo_id).delete()
-        db_files = [
-            RepositoryFile(
-                repository_id=repo_id,
-                path=f["path"],
-                extension=f["extension"],
-                size_bytes=f["size_bytes"],
-                content_hash=f["content_hash"],
-                is_text=f["is_text"]
-            )
+        
+        # Optimize database writes by using bulk_insert_mappings
+        mappings = [
+            {
+                "id": uuid.uuid4(),
+                "repository_id": repo_id,
+                "path": f["path"],
+                "extension": f["extension"],
+                "size_bytes": f["size_bytes"],
+                "content_hash": f["content_hash"],
+                "is_text": f["is_text"]
+            }
             for f in files_metadata
         ]
-        db.bulk_save_objects(db_files)
+        db.bulk_insert_mappings(RepositoryFile, mappings)
         db.commit()
+        
+        # Immediately clear mappings list to release memory
+        mappings.clear()
+        del mappings
 
         t_parse = time.perf_counter() - t_parse_start
         logger.info(f"[Pipeline {pipeline_id}] END Parsing ({t_parse:.2f}s)")
