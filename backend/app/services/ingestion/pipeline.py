@@ -110,14 +110,19 @@ def run_phase_b(db, repo, repo_id: uuid.UUID, clone_path: str, pipeline_id: str,
     update_pipeline_progress(db, repo, pipeline_id, "knowledge", "running")
     
     try:
-        from app.services.knowledge.pipeline import build_knowledge_base
-        build_knowledge_base(repo_id, clone_path, file_contents)
-        
-        t_kb = time.perf_counter() - t_kb_start
-        logger.info(f"[Pipeline {pipeline_id}] END Knowledge Base Indexing ({t_kb:.2f}s)")
+        if settings.ENABLE_KNOWLEDGE_BASE:
+            from app.services.knowledge.pipeline import build_knowledge_base
+            build_knowledge_base(repo_id, clone_path, file_contents)
+            t_kb = time.perf_counter() - t_kb_start
+            logger.info(f"[Pipeline {pipeline_id}] END Knowledge Base Indexing ({t_kb:.2f}s)")
+            update_pipeline_progress(db, repo, pipeline_id, "knowledge", "completed", t_kb)
+        else:
+            t_kb = time.perf_counter() - t_kb_start
+            logger.info(f"[Pipeline {pipeline_id}] SKIPPED Knowledge Base Indexing (disabled via settings)")
+            update_pipeline_progress(db, repo, pipeline_id, "knowledge", "completed", t_kb)
+            
         db.expire(repo, ['knowledge_summary'])
         db.refresh(repo)
-        update_pipeline_progress(db, repo, pipeline_id, "knowledge", "completed", t_kb)
     except Exception as kb_err:
         t_kb = time.perf_counter() - t_kb_start
         logger.error(f"[Pipeline {pipeline_id}] FAILED Knowledge Base Indexing: {kb_err}", exc_info=True)

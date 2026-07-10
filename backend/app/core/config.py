@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Storage settings for preserved clones
     CLONE_DIR: str = "temp_clones"
 
+    # Flag to conditionally enable/disable Knowledge Base (embeddings generation) to save memory/credits
+    ENABLE_KNOWLEDGE_BASE: bool = True
+
     # CORS Settings
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
