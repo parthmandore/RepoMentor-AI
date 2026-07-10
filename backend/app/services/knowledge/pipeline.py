@@ -375,6 +375,10 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                 selected_chunks = select_best_chunks(candidate_chunks, max_budget=target_code_chunks, sec_issues=sec_issues)
                 log_info(f"[Knowledge] Global budget enforcement: selected {len(selected_chunks)} chunks from {len(candidate_chunks)} candidates. Target was {target_code_chunks}.")
                 
+                # Clear raw candidate chunks list immediately to release memory
+                candidate_chunks.clear()
+                del candidate_chunks
+                
                 # Add surviving chunks to queue
                 for chunk in selected_chunks:
                     chunk_queue.put(chunk)
@@ -463,12 +467,19 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                 continue
                 
             batch_chunks, batch_embeddings = item
+            batch_size = len(batch_chunks)
             t_db_call_start = time.perf_counter()
             s_vector_repo.insert_embeddings(repo_id, batch_chunks, batch_embeddings)
             db_durations.append(time.perf_counter() - t_db_call_start)
             
-            chunks_embedded += len(batch_chunks)
-            chunks_generated += len(batch_chunks)
+            # Release batch memory immediately
+            batch_chunks.clear()
+            batch_embeddings.clear()
+            del batch_chunks
+            del batch_embeddings
+            
+            chunks_embedded += batch_size
+            chunks_generated += batch_size
             
             # Recalculate progressive stats
             processed_files = int((chunks_embedded / max(1, total_chunks_est)) * total_files)
@@ -517,6 +528,13 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         s_db.commit()
         
         s_db.close()
+        
+        # Release the ONNX embedding model global cache and trigger garbage collection immediately.
+        # This frees ~2.0 GB of native RAM before entering the final Metadata Save phase.
+        from app.services.knowledge import embedder
+        import gc
+        embedder._model = None
+        gc.collect()
 
         # 6. Metadata Save
         failure_stage = "Metadata Save"
