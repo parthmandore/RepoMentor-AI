@@ -96,8 +96,10 @@ public class Helper {
         assert java_path in layers.get("utilities", []) or py_path in layers.get("utilities", [])
         
         # Verify file records have metrics and metadata
-        db_session.refresh(py_file)
-        db_session.refresh(java_file)
+        py_file = db_session.query(RepositoryFile).filter_by(id=py_file.id).first()
+        java_file = db_session.query(RepositoryFile).filter_by(id=java_file.id).first()
+        assert py_file is not None
+        assert java_file is not None
         assert py_file.lines_of_code > 0
         assert java_file.lines_of_code > 0
         assert py_file.complexity > 0

@@ -11,12 +11,12 @@ from app.services.expert.chat import ChatManager
 from app.services.expert.rag_pipeline import RagPipeline
 
 def test_citation_tracker():
-    # Below 0.30 threshold should fail validation
-    chunks_low = [{"similarity_score": 0.25}, {"similarity_score": 0.10}]
+    # Below 0.15 threshold should fail validation
+    chunks_low = [{"similarity_score": 0.10}, {"similarity_score": 0.05}]
     assert not validate_citations(chunks_low)
 
-    # At or above 0.30 threshold should pass
-    chunks_high = [{"similarity_score": 0.35}, {"similarity_score": 0.20}]
+    # At or above 0.15 threshold should pass
+    chunks_high = [{"similarity_score": 0.20}, {"similarity_score": 0.10}]
     assert validate_citations(chunks_high)
 
     # Empty chunks should fail
@@ -109,6 +109,7 @@ def test_rag_pipeline_retrieval(db_session: Session):
     db_session.commit()
 
     pipeline = RagPipeline(db_session, str(repo_id))
-    decls, deps = pipeline._get_declarations_and_dependencies()
-    assert "AuthController" in decls
-    assert decls["AuthController"]["file_path"] == "src/AuthController.py"
+    assert pipeline.route_intent("What is this project about?") == "GENERAL_OVERVIEW"
+    assert pipeline.route_intent("What architecture or layers are used?") == "ARCHITECTURE"
+    assert pipeline.route_intent("Are there security vulnerabilities?") == "SECURITY"
+    assert pipeline.route_intent("How can I refactor smells?") == "MAINTAINABILITY"

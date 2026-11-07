@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c3aed" />
+      <stop offset="100%" stop-color="#4338ca" />
+    </linearGradient>
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#c4b5fd" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0.3" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+  <!-- Main Rounded Rect -->
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="12" />
+  <!-- Terminal Chevron -->
+  <path d="M 144 176 L 244 264 L 144 352" fill="none" stroke="#ffffff" stroke-width="36" stroke-linecap="round" stroke-linejoin="round" />
+  <!-- Terminal Underscore -->
+  <line x1="280" y1="352" x2="376" y2="352" stroke="#ffffff" stroke-width="36" stroke-linecap="round" />
+  <!-- Amber AI Sparkle -->
+  <path d="M 388 88 Q 388 128 428 128 Q 388 128 388 168 Q 388 128 348 128 Q 388 128 388 88 Z" fill="#fbbf24" filter="url(#glow)" />
+</svg>
