@@ -36,3 +36,7 @@ Thumbs.db
 # Runtime artifacts
 temp_clones/
 backend/temp_clones/
+tmp/
+scratch/
+audit/
+*.log

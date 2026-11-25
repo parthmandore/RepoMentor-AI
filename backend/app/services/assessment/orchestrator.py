@@ -234,6 +234,7 @@ def run_assessment(db: Session, repository_id: uuid.UUID) -> Dict[str, Any]:
     }
     
     # 11. Store back under repo.knowledge_summary["assessment"]
+    db.refresh(repo)
     summary = dict(repo.knowledge_summary or {})
     
     # Preserve score history evolution (Task 9 Evolution tracking)
@@ -248,7 +249,9 @@ def run_assessment(db: Session, repository_id: uuid.UUID) -> Dict[str, Any]:
     # Keep only last 10 runs
     summary["history"] = history[-10:]
     summary["assessment"] = assessment_payload
-    repo.knowledge_summary = summary
+    repo.knowledge_summary = dict(summary)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(repo, "knowledge_summary")
     db.commit()
     
     return assessment_payload

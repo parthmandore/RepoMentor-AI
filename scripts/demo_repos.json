@@ -1,0 +1,44 @@
+[
+  {
+    "name": "Gyan",
+    "owner_repo": "parthmandore/Gyan",
+    "url": "https://github.com/parthmandore/Gyan",
+    "desc": "Gamified vernacular education app (React Native, TypeScript)",
+    "badge": "Mobile / TS"
+  },
+  {
+    "name": "RepoMentor",
+    "owner_repo": "parthmandore/RepoMentor-AI",
+    "url": "https://github.com/parthmandore/RepoMentor-AI",
+    "desc": "Automated repository architecture & code health platform (FastAPI, Next.js)",
+    "badge": "Fullstack"
+  },
+  {
+    "name": "DocuMind",
+    "owner_repo": "parthmandore/DocuMind",
+    "url": "https://github.com/parthmandore/DocuMind",
+    "desc": "Local AI document intelligence & semantic retrieval engine (Python, FastAPI)",
+    "badge": "AI / RAG"
+  },
+  {
+    "name": "CodeMyPicture",
+    "owner_repo": "parthmandore/CodeMyPicture",
+    "url": "https://github.com/parthmandore/CodeMyPicture",
+    "desc": "AI code screenshot & visual syntax transformer",
+    "badge": "React"
+  },
+  {
+    "name": "URL Shortener API",
+    "owner_repo": "parthmandore/url-shortener-api",
+    "url": "https://github.com/parthmandore/url-shortener-api",
+    "desc": "High-throughput URL shortening service (Spring Boot, Java)",
+    "badge": "Java / Spring"
+  },
+  {
+    "name": "Express.js",
+    "owner_repo": "expressjs/express",
+    "url": "https://github.com/expressjs/express",
+    "desc": "Fast, unopinionated, minimalist web framework for Node.js",
+    "badge": "Node.js"
+  }
+]

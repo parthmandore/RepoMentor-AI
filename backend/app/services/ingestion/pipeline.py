@@ -1,3 +1,4 @@
+from sqlalchemy.orm.attributes import flag_modified
 import os
 import time
 import shutil
@@ -9,7 +10,7 @@ from app.db.session import SessionLocal
 from app.models.repository import Repository, RepositoryStatus
 from app.models.repository_file import RepositoryFile
 from app.core.config import settings
-from app.services.ingestion.cloner import clone_repository, IngestionError
+from app.services.ingestion.cloner import clone_repository, IngestionError, safe_clean_dir
 from app.services.ingestion.parser import parse_repository
 from app.services.ingestion.tech_detector import detect_technologies
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 def update_pipeline_progress(db, repo, pipeline_id: str, stage_name: str, stage_status: str, duration: float = None, warning: str = None):
     """
     Updates the rich pipeline stage-level progress metadata inside repo.knowledge_summary JSON.
+    Optimized to eliminate full row db.refresh reloads over WAN.
     """
     summary = dict(repo.knowledge_summary or {})
     meta = summary.get("pipeline_metadata", {
@@ -49,7 +51,8 @@ def update_pipeline_progress(db, repo, pipeline_id: str, stage_name: str, stage_
         meta["warnings"].append(warning)
         
     summary["pipeline_metadata"] = meta
-    repo.knowledge_summary = summary
+    repo.knowledge_summary = dict(summary)
+    flag_modified(repo, "knowledge_summary")
     db.commit()
 
 
@@ -100,7 +103,7 @@ def calculate_health_score_from_db(db, repo_id: uuid.UUID, repo) -> tuple[int, s
     return final_score, grade, health_data
 
 
-def run_phase_b(db, repo, repo_id: uuid.UUID, clone_path: str, pipeline_id: str, file_contents: dict = None) -> None:
+def run_phase_b(db, repo, repo_id: uuid.UUID, clone_path: str, pipeline_id: str, file_contents: dict = None, remote_hash: str = None) -> None:
     """
     Executes Phase B (Knowledge Base indexing + Assessment generation) sequentially in the background.
     """
@@ -141,6 +144,8 @@ def run_phase_b(db, repo, repo_id: uuid.UUID, clone_path: str, pipeline_id: str,
     
     try:
         from app.services.assessment.orchestrator import run_assessment
+        db.expire_all()
+        db.refresh(repo)
         run_assessment(db, repo_id)
         
         t_assess = time.perf_counter() - t_assess_start
@@ -148,14 +153,26 @@ def run_phase_b(db, repo, repo_id: uuid.UUID, clone_path: str, pipeline_id: str,
         db.expire(repo, ['knowledge_summary'])
         db.refresh(repo)
         update_pipeline_progress(db, repo, pipeline_id, "assessment", "completed", t_assess)
+        
+        # Record assessment timing and full end-to-end total in performance metrics
+        summary = dict(repo.knowledge_summary or {})
+        perf = dict(summary.get("performance") or {})
+        perf["assessment"] = round(t_assess, 3)
+        perf["total"] = round(perf.get("total", 0.0) + t_assess, 3)
+        summary["performance"] = perf
+        if remote_hash:
+            summary["last_commit_hash"] = remote_hash
+        repo.knowledge_summary = dict(summary)
+        flag_modified(repo, "knowledge_summary")
+        repo.duration_seconds = perf["total"]
+        db.commit()
     except Exception as assess_err:
         t_assess = time.perf_counter() - t_assess_start
         logger.error(f"[Pipeline {pipeline_id}] FAILED Assessment Compilation: {assess_err}", exc_info=True)
         update_pipeline_progress(db, repo, pipeline_id, "assessment", "failed", t_assess, f"Assessment failed: {str(assess_err)}")
 
     # Clean up local clone files to preserve disk space (Component 14)
-    if os.path.exists(clone_path):
-        shutil.rmtree(clone_path, ignore_errors=True)
+    safe_clean_dir(clone_path)
     
     try:
         db.refresh(repo)
@@ -221,7 +238,8 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
             timing = summary.get("timing_metadata", {})
             timing["cache_hit"] = True
             summary["timing_metadata"] = timing
-            repo.knowledge_summary = summary
+            repo.knowledge_summary = dict(summary)
+            flag_modified(repo, "knowledge_summary")
             repo.status_message = "Ready"
             db.commit()
             
@@ -248,8 +266,7 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
         # Re-clone temporarily to read text file contents for embedding generation
         try:
             # Recreate clone directory if pre-existing
-            if os.path.exists(clone_path):
-                shutil.rmtree(clone_path, ignore_errors=True)
+            safe_clean_dir(clone_path)
             
             clone_repository(repo.url, clone_path)
             # Re-run fast parser to populate file_contents dictionary in-memory
@@ -276,7 +293,7 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
         repo.status_message = "Generating Knowledge"
         db.commit()
         # Jump directly to Phase B execution
-        run_phase_b(db, repo, repo_id, clone_path, pipeline_id, file_contents)
+        run_phase_b(db, repo, repo_id, clone_path, pipeline_id, file_contents, remote_hash)
         return
 
     # Normal execution - Initialize progress metadata and run Phase A
@@ -290,6 +307,7 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
     try:
         repo.status = RepositoryStatus.CLONING
         repo.status_message = "Cloning repository..."
+        repo.knowledge_status = "pending"
         repo.started_at = started_at
         repo.error_message = None
         db.commit()
@@ -323,25 +341,41 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
         # Clear existing file records
         db.query(RepositoryFile).filter(RepositoryFile.repository_id == repo_id).delete()
         
-        # Optimize database writes by using bulk_insert_mappings
-        mappings = [
-            {
-                "id": uuid.uuid4(),
-                "repository_id": repo_id,
-                "path": f["path"],
-                "extension": f["extension"],
-                "size_bytes": f["size_bytes"],
-                "content_hash": f["content_hash"],
-                "is_text": f["is_text"]
-            }
+        # Optimize database writes by using multi-row execute_values
+        from psycopg2.extras import execute_values
+        import json
+        file_tuples = [
+            (
+                str(uuid.uuid4()),
+                str(repo_id),
+                f["path"],
+                f["extension"],
+                f["size_bytes"],
+                f["content_hash"],
+                f["is_text"],
+                0,
+                0,
+                0,
+                "Unknown",
+                json.dumps([]),
+                json.dumps([]),
+                0,
+                0.0,
+                False
+            )
             for f in files_metadata
         ]
-        db.bulk_insert_mappings(RepositoryFile, mappings)
+        insert_rf_sql = """
+        INSERT INTO repository_files (
+            id, repository_id, path, extension, size_bytes, content_hash, is_text,
+            lines_of_code, complexity, code_smells_count, module_type,
+            incoming_dependencies, outgoing_dependencies, coupling_score, instability_score, in_dependency_cycle
+        ) VALUES %s
+        """
+        raw_conn = db.connection().connection
+        with raw_conn.cursor() as cur:
+            execute_values(cur, insert_rf_sql, file_tuples, page_size=1000)
         db.commit()
-        
-        # Immediately clear mappings list to release memory
-        mappings.clear()
-        del mappings
 
         t_parse = time.perf_counter() - t_parse_start
         logger.info(f"[Pipeline {pipeline_id}] END Parsing ({t_parse:.2f}s)")
@@ -400,8 +434,11 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
     from app.services.analysis.pipeline import analyze_repository
     
     err_scan = None
+    scan_timings = {"metrics": 0.0, "architecture": 0.0, "security": 0.0}
     try:
-        analyze_repository(repo_id, clone_path, file_contents)
+        result_timings = analyze_repository(repo_id, clone_path, file_contents)
+        if result_timings and isinstance(result_timings, dict):
+            scan_timings = result_timings
         status_scan = "completed"
     except Exception as scan_err:
         logger.error(f"[Pipeline {pipeline_id}] Merged Scanners Failed: {scan_err}", exc_info=True)
@@ -413,9 +450,13 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
 
     # Retrieve fresh repo model instance
     db.refresh(repo)
-    update_pipeline_progress(db, repo, pipeline_id, "metrics", status_scan, t_parallel, err_scan)
-    update_pipeline_progress(db, repo, pipeline_id, "architecture", status_scan, 0.0)
-    update_pipeline_progress(db, repo, pipeline_id, "security", status_scan, 0.0)
+    t_m = scan_timings.get("metrics", 0.0)
+    t_a = scan_timings.get("architecture", 0.0)
+    t_s = scan_timings.get("security", 0.0)
+    t_db = scan_timings.get("database", 0.0)
+    update_pipeline_progress(db, repo, pipeline_id, "metrics", status_scan, t_m, err_scan)
+    update_pipeline_progress(db, repo, pipeline_id, "architecture", status_scan, t_a)
+    update_pipeline_progress(db, repo, pipeline_id, "security", status_scan, t_s)
 
     if status_scan == "failed":
         handle_phase_a_failure(db, repo, clone_path, started_at, Exception(err_scan))
@@ -428,23 +469,36 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
     completed_at = datetime.now(timezone.utc)
     
     try:
-        # Calculate grade & health score from DB metrics immediately
-        health_score, grade, health_meta = calculate_health_score_from_db(db, repo_id, repo)
-        repo.health_score = health_score
-        repo.health_grade = grade
-
         summary = repo.knowledge_summary or {}
-        summary["health_metadata"] = health_meta
+        budget_info = summary.get("analysis_budget") or scan_timings.get("analysis_budget") or {}
+        summary["analysis_budget"] = budget_info
+        if remote_hash:
+            summary["last_commit_hash"] = remote_hash
         summary["timing_metadata"] = {
-            "clone": round(t_clone, 2),
-            "parsing": round(t_parse + t_tech, 2),
-            "metrics": round(t_parallel, 2),
-            "architecture": 0.0,
-            "security": 0.0,
-            "total_phase_a": round(t_phase_a, 2),
+            "clone": round(t_clone, 3),
+            "parsing": round(t_parse + t_tech, 3),
+            "metrics": round(t_m, 3),
+            "architecture": round(t_a, 3),
+            "security": round(t_s, 3),
+            "database": round(t_db, 3),
+            "phase_a_database": round(t_db, 3),
+            "total_phase_a": round(t_phase_a, 3),
             "cache_hit": False
         }
-        repo.knowledge_summary = summary
+        summary["performance"] = {
+            "clone": round(t_clone, 3),
+            "parser": round(t_parse + t_tech, 3),
+            "metrics": round(t_m, 3),
+            "architecture": round(t_a, 3),
+            "security": round(t_s, 3),
+            "phase_a_database": round(t_db, 3),
+            "vector_database": 0.0,
+            "time_to_first_page": round(t_phase_a, 3),
+            "total": round(t_phase_a, 3),
+            "analysis_budget": budget_info
+        }
+        repo.knowledge_summary = dict(summary)
+        flag_modified(repo, "knowledge_summary")
         
         repo.status = RepositoryStatus.READY
         repo.status_message = "Generating Knowledge"
@@ -459,13 +513,12 @@ def ingest_repository(repo_id: uuid.UUID) -> None:
         return
 
     # Trigger Phase B sequentially
-    run_phase_b(db, repo, repo_id, clone_path, pipeline_id, file_contents)
+    run_phase_b(db, repo, repo_id, clone_path, pipeline_id, file_contents, remote_hash)
 
 
 def handle_phase_a_failure(db, repo, clone_path: str, started_at: datetime, error: Exception):
     """Refactored fail-safe cleanup and update for Phase A stop failures."""
-    if os.path.exists(clone_path):
-        shutil.rmtree(clone_path, ignore_errors=True)
+    safe_clean_dir(clone_path)
 
     try:
         db.rollback()

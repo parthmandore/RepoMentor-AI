@@ -53,21 +53,14 @@ async def lifespan(app: FastAPI):
             
         # 4. Connection pool pre-heating/warm-up
         logger.info("Pre-heating database connection pool...")
-        from concurrent.futures import ThreadPoolExecutor
         from sqlalchemy import text
-        def warm_connection():
-            w_db = SessionLocal()
-            try:
-                w_db.execute(text("SELECT 1"))
-            except Exception as e:
-                logger.warning(f"Connection warm-up error: {e}")
-            finally:
-                w_db.close()
-        
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(warm_connection) for _ in range(5)]
-            for f in futures:
-                f.result()
+        w_db = SessionLocal()
+        try:
+            w_db.execute(text("SELECT 1"))
+        except Exception as e:
+            logger.warning(f"Connection warm-up error: {e}")
+        finally:
+            w_db.close()
         logger.info("Database connection pool warmed up successfully.")
         
     except Exception as e:
@@ -94,8 +87,10 @@ if settings.CORS_ORIGINS:
         allow_headers=["*"],
     )
 
-# Include API routers under the API version prefix
+# Include API routers under the API version prefix and convenience roots
 app.include_router(health_router, prefix=settings.API_V1_STR)
+app.include_router(health_router, prefix="/api")
+app.include_router(health_router)
 app.include_router(repositories_router, prefix=settings.API_V1_STR)
 
 # Also map health check at root for convenience

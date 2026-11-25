@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+temp_clones/
+.git
+.gitignore
+.env
+check_status.py
+update_*.py

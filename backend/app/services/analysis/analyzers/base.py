@@ -40,6 +40,21 @@ class BaseAnalyzer(ABC):
         """Set of supported extensions for this analyzer."""
         pass
 
+    def analyze_full(self, file_path: str, content: str, extension: str) -> Dict[str, Any]:
+        """Default full analysis for analyzers without a specialized single-pass implementation."""
+        size_result = self.analyze_size(content, extension)
+        declarations = self.extract_declarations(content, extension)
+        dependencies = self.extract_dependencies(content, extension)
+        complexity_result = self.analyze_complexity(content, extension)
+        smells = self.detect_smells(file_path, content, extension, size_result, complexity_result)
+        return {
+            "size_result": size_result,
+            "declarations": declarations,
+            "dependencies": dependencies,
+            "complexity_result": complexity_result,
+            "smells": smells
+        }
+
 
 class BraceLanguageAnalyzer(BaseAnalyzer):
     """Common analyzer for languages that use curly braces {} for blocks."""
@@ -81,12 +96,14 @@ class BraceLanguageAnalyzer(BaseAnalyzer):
         brace_count = 0
         found_open = False
         for j in range(start_index, len(lines)):
-            for char in lines[j]:
-                if char == "{":
-                    brace_count += 1
-                    found_open = True
-                elif char == "}":
-                    brace_count -= 1
+            line = lines[j]
+            opens = line.count("{")
+            closes = line.count("}")
+            if opens:
+                brace_count += opens
+                found_open = True
+            if closes:
+                brace_count -= closes
             if found_open and brace_count <= 0:
                 return j + 1
         return len(lines)

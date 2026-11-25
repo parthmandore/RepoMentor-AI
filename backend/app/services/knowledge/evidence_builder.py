@@ -23,7 +23,7 @@ def build_evidence_documents(
         "summary": "Deterministic size and file statistics captured during discover engine scan.",
         "evidence": f"Total Files: {repo_data.get('total_files')}, Total Folders: {repo_data.get('total_folders')}, Text Files: {repo_data.get('text_file_count')}, Binary Files: {repo_data.get('binary_file_count')}",
         "source_phase": "Phase 2: Repository Ingestion Pipeline",
-        "source_file": "README.md",
+        "source_file": "Repo summary: Overview",
         "metadata": {
             "repo_id": repo_id_str,
             "type": "summary"
@@ -39,7 +39,7 @@ def build_evidence_documents(
         "summary": "Identified frameworks, package managers, and language percentages.",
         "evidence": f"Languages: {repo_data.get('language_breakdown')}, Frameworks: {tech_stack.get('frameworks')}, Package Manager: {tech_stack.get('package_manager')}",
         "source_phase": "Phase 2: Repository Ingestion Pipeline",
-        "source_file": "package.json / requirements.txt",
+        "source_file": "Repo summary: Technology",
         "metadata": {
             "repo_id": repo_id_str,
             "type": "technology"
@@ -54,7 +54,7 @@ def build_evidence_documents(
         "summary": f"Health score is {repo_data.get('health_score')} (Grade {repo_data.get('health_grade')}) with average complexity {repo_data.get('average_complexity')}.",
         "evidence": f"Total LOC: {repo_data.get('total_lines_of_code')}, Avg Complexity: {repo_data.get('average_complexity')}, Max Complexity: {repo_data.get('max_complexity')}, Duplication: {repo_data.get('duplication_percentage')}%, Code Smells: {repo_data.get('total_smells')}",
         "source_phase": "Phase 3: Deterministic Analysis Engine",
-        "source_file": "aggregator.py",
+        "source_file": "Repo summary: Metrics",
         "metadata": {
             "repo_id": repo_id_str,
             "type": "metrics_summary"
@@ -104,7 +104,7 @@ def build_evidence_documents(
         "summary": f"Identified pattern: {arch_sum.get('pattern')} with {arch_sum.get('confidence')}% confidence. Health: {repo_data.get('architecture_score')} (Grade {repo_data.get('architecture_grade')}).",
         "evidence": f"Total Modules: {arch_sum.get('total_modules')}, Entry Points: {arch_sum.get('entry_points')}, Dependency Cycles: {arch_sum.get('cycles_count')}, Most Coupled: {arch_sum.get('most_coupled_module')}",
         "source_phase": "Phase 4: Software Architecture Explorer",
-        "source_file": "pipeline.py",
+        "source_file": "Repo summary: Architecture",
         "metadata": {
             "repo_id": repo_id_str,
             "type": "architecture_summary"

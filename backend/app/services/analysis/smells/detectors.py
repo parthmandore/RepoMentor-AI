@@ -76,31 +76,25 @@ class DeepNestingDetector(BaseSmellDetector):
 
 
 class MagicNumbersDetector(BaseSmellDetector):
+    HAS_DIGIT_RE = re.compile(r"\d")
+    STANDALONE_NUMBER_RE = re.compile(r"(?<![.\w])(-?\d+\.?\d*)(?![.\w])")
+    SKIP_LINE_RE = re.compile(
+        r"^\s*(?:#|//|/?\*|import\s|from\s|(?:export\s+)?const\s+[A-Z_]+|public\s+static\s+final\s+[A-Z_]+)"
+    )
+
     def detect(self, file_path: str, content: str, extension: str, size_metrics: Dict[str, Any], complexity_metrics: Dict[str, Any], declarations: List[Dict[str, Any]], dependencies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if extension not in {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".c", ".h", ".cpp", ".hpp", ".cs", ".go", ".rs", ".kt", ".php"}:
             return []
 
-        # Standalone numeric literals
-        number_re = re.compile(r"(?<![.\w])(-?\d+\.?\d*)(?![.\w])")
-        
-        # Skip comments and imports
-        skip_patterns = [
-            re.compile(r"^\s*#"),
-            re.compile(r"^\s*//"),
-            re.compile(r"^\s*/?\*"),
-            re.compile(r"^\s*import\s"),
-            re.compile(r"^\s*from\s"),
-            re.compile(r"^\s*(?:export\s+)?const\s+[A-Z_]+"),
-            re.compile(r"^\s*public\s+static\s+final\s+[A-Z_]+"),
-        ]
-
         smells = []
         for line_num, line in enumerate(content.split("\n"), start=1):
             stripped = line.strip()
-            if not stripped or any(p.match(stripped) for p in skip_patterns):
+            if not stripped or not self.HAS_DIGIT_RE.search(stripped):
+                continue
+            if self.SKIP_LINE_RE.match(stripped):
                 continue
 
-            for match in number_re.finditer(stripped):
+            for match in self.STANDALONE_NUMBER_RE.finditer(stripped):
                 try:
                     val = float(match.group(1))
                 except ValueError:

@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import uuid
+from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.repository import Repository
@@ -13,6 +14,9 @@ from app.services.expert.citation_tracker import validate_citations
 from app.services.expert.confidence import calculate_confidence
 from app.services.llm.groq_service import GroqService
 from app.repositories.vector_repository import VectorRepository
+
+from sqlalchemy import text
+from app.services.expert.fact_sheet import build_repo_fact_sheet
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +32,10 @@ EXPERT_PROMPTS = {
 EXPLAIN_MODES = {}
 
 class RagPipeline:
-    def __init__(self, db: Session, repo_id: str):
+    def __init__(self, db: Session, repo_id: str, repo: Optional[Repository] = None):
         self.db = db
         self.repo_uuid = uuid.UUID(repo_id) if isinstance(repo_id, str) else repo_id
-        self.repo = db.query(Repository).filter(Repository.id == self.repo_uuid).first()
+        self.repo = repo if repo is not None else db.query(Repository).filter(Repository.id == self.repo_uuid).first()
 
     def route_intent(self, question: str) -> str:
         """
@@ -103,8 +107,8 @@ class RagPipeline:
             })
             retrieval_steps.append("Pre-loaded README file headers")
 
-        # Step 2: Vector Search
-        vector_limit = 4 if intent == "CODE_SEMANTIC" else 2
+        # Step 2: Hybrid Search (Vector + Keyword RRF)
+        vector_limit = 6
         vector_chunks = retrieve_grounded_context(str(self.repo_uuid), question, limit=vector_limit, db=self.db)
         
         # Step 3: Neighbor Expansion (Component 5 & 6)
@@ -164,79 +168,121 @@ class RagPipeline:
         history: list[dict] = None
     ) -> tuple[str, str, list[dict], int, list[str]]:
         """
-        Runs RAG retrieval and constructs the system instruction and final prompt.
+        Runs RAG retrieval and constructs the system instruction and compact final prompt.
+        Always includes compact Repo Fact Sheet (<600 tokens) and keeps total prompt under 3000 tokens.
         """
         if not self.repo:
             return "", "", [], 0, []
 
-        # 1. Retrieve evidence
+        # 1. Check index completeness and model/dimension match
+        summary = self.repo.knowledge_summary or {}
+        expected_chunks = summary.get("expected_chunk_count")
+        
+        # Query stored chunk count and model in DB
+        chunk_info = self.db.execute(text("""
+            SELECT 
+                count(*) as stored_total,
+                count(*) FILTER (WHERE chunk_type NOT IN ('evidence', 'Evidence')) as stored_code,
+                max(embedding_model) as model,
+                max(embedding_dim) as dim
+            FROM repository_embeddings
+            WHERE repository_id = :rid
+        """), {"rid": self.repo_uuid}).fetchone()
+
+        stored_total = chunk_info[0] or 0
+        stored_code = chunk_info[1] or 0
+        stored_model = chunk_info[2]
+        stored_dim = chunk_info[3]
+
+        from app.services.knowledge.embedder import get_active_embedding_provider
+        active_provider = get_active_embedding_provider()
+        current_model = active_provider.model_name if active_provider else None
+        current_dim = active_provider.dimension if active_provider else None
+
+        intent = self.route_intent(question)
+
+        # Informational check: if stored model differs from active provider, retrieval seamlessly falls back to PostgreSQL keyword search
+        if stored_total > 0 and stored_model and active_provider and (stored_model != current_model or stored_dim != current_dim):
+            logger.info(f"Model mismatch detected (stored={stored_model} d={stored_dim}, active={current_model} d={current_dim}). Falling back to PostgreSQL full-text keyword retrieval.")
+
+        # Check if repository contains no analysable code (e.g. notebooks only)
+        if self.repo.total_lines_of_code == 0:
+            lower_q = question.lower()
+            if any(term in lower_q for term in ["smell", "maintainab", "refactor", "complexity", "debt", "clean"]):
+                refusal_text = "No code scanned: repository contains only notebooks or unrecognised formats. Analysis metrics and code smells cannot be evaluated."
+                return refusal_text, "", [], 0, ["Refused: No analysable code in repository"]
+
+        # If no chunks at all exist, refuse cleanly
+        if stored_total == 0:
+            refusal_text = "Repository index is not yet built. Please wait for initial repository analysis to complete."
+            return refusal_text, "", [], 0, ["Repository index empty"]
+
+        # 2. Retrieve grounded evidence chunks
         chunks, steps = self.retrieve_grounded_evidence(question)
         confidence = calculate_confidence(chunks)
         
-        # 2. Check citation validity (includes fallbacks)
-        if not validate_citations(chunks):
-            refusal_prompt = "I couldn't find enough information in the indexed repository to answer that confidently."
-            return refusal_prompt, "", [], 0, steps
+        # 3. Code-level refusal decision: if retrieval returns no chunks
+        if not chunks:
+            refusal_text = "I couldn't find relevant code or documentation in this repository to answer that question. You can ask about the architecture, detected technologies, or specific files."
+            return refusal_text, "", [], 0, steps
 
-        # 3. Format prompt context (with character budget to avoid Groq 413 errors)
-        MAX_EVIDENCE_CHARS = 8000
+        # 4. Generate compact Repo Fact Sheet (~150-250 tokens, max 600)
+        try:
+            fact_sheet = build_repo_fact_sheet(self.repo, self.db)
+        except Exception as fs_err:
+            logger.warning(f"Error building fact sheet: {fs_err}")
+            fact_sheet = f"Repository: {self.repo.url} | Health: {self.repo.health_score}/100"
+
+        # 5. Format prompt context with strict character budget to ensure total prompt < 3,000 tokens
+        MAX_EVIDENCE_CHARS = 4500
         evidence_str = ""
         current_evidence_len = 0
         budgeted_chunks = []
         for i, ch in enumerate(chunks):
-            chunk_text = f"\n--- Evidence Chunk {i+1} ({ch.get('file_path')}:{ch.get('line_numbers')}) ---\n{ch.get('content')}\n"
+            ch_fp = ch.get("file_path", "")
+            ch_lines = ch.get("line_numbers")
+            hdr = f"\n--- Evidence Chunk {i+1} ({ch_fp}{f' L{ch_lines}' if ch_lines else ''}) ---\n"
+            content_snippet = ch.get("content", "")
+            chunk_text = hdr + content_snippet + "\n"
             if current_evidence_len + len(chunk_text) > MAX_EVIDENCE_CHARS and len(budgeted_chunks) >= 1:
                 break
             budgeted_chunks.append(ch)
             evidence_str += chunk_text
             current_evidence_len += len(chunk_text)
         chunks = budgeted_chunks
-            
-        tech_stack = self.repo.tech_stack or {}
-        frameworks = tech_stack.get("frameworks", [])
-        
-        # Historical messages memory
+
+        # Historical messages memory (last 2 turns)
         history_str = ""
         if history:
-            for h in history[-3:]: # Keep last 3 turns
+            for h in history[-2:]:
                 role = "User" if h.get("role") == "user" else "Assistant"
                 history_str += f"{role}: {h.get('content')}\n"
 
         system_instruction = EXPERT_PROMPTS["General"]
-        explain_str = ""
 
         prompt = f"""<SYSTEM>
 {system_instruction}
-{explain_str}
 
-Ensure you STRICTLY follow these safety guidelines:
-1. Only answer using the Repository Code & Context below.
-2. Never invent files, methods, classes, APIs, functionality, or vulnerabilities.
-3. If repository evidence is insufficient to answer the question, state exactly: "I couldn't find enough information in the indexed repository to answer that confidently."
-4. Never speculate or guess. Do not say "I think", "probably", "might", etc.
-5. Sound like an experienced senior software engineer. Respond conversationally and directly. Never start your response or sentences with referencing preambles like "Based on the...", "According to the...", "As seen in...", "Looking at...", "Based on the security summary...", or similar. Directly state your engineering findings and analysis.
+Ensure you follow these engineering guidelines:
+1. Answer what the repository evidence and fact sheet support directly and factually.
+2. If specific implementation details are missing from the retrieved context, explain what is known from the available evidence and clearly state what specific information is not in the indexed snippets.
+3. Never invent non-existent files, functions, classes, dependencies, or security vulnerabilities.
+4. Speak conversationally and directly like a staff software engineer. Do not use robotic preambles like "Based on the provided evidence..." or "According to the context...".
 </SYSTEM>
 
---- Repository Code & Context ---
+{fact_sheet}
+
+--- Retrieved Repository Code & Evidence ---
 {evidence_str}
-
---- Repository Stats ---
-URL: {self.repo.url}
-LOC: {self.repo.total_lines_of_code}
-Frameworks: {', '.join(frameworks)}
-Health Score: {self.repo.health_score} (Grade {self.repo.health_grade})
-
---- Architectural Blueprint ---
-{json.dumps(self.repo.architecture_summary or {})}
-
---- Security Assessment ---
-{json.dumps(self.repo.security_summary or {})}
 
 --- Conversation History ---
 {history_str}
 
 Question: {question}
 Answer:"""
+
+        est_prompt_tokens = len(prompt) // 4
+        logger.info(f"[Mentor Prompt Prepared] Repo: {self.repo.id} | Chunks: {len(chunks)} | Prompt chars: {len(prompt)} (~{est_prompt_tokens} tokens)")
 
         return prompt, system_instruction, chunks, confidence, steps
 
@@ -284,6 +330,7 @@ Answer:"""
                 fallback_answer += f"- **{ch.get('file_path')}** (Lines {ch.get('line_numbers')}, Similarity: {ch.get('similarity_score')}):\n"
                 fallback_answer += f"  ```\n  {ch.get('content')[:120].strip()}...\n  ```\n"
                 
+            frameworks = (self.repo.tech_stack or {}).get("frameworks", [])
             fallback_answer += (
                 f"\n### Repository Highlights\n"
                 f"- Frameworks: {', '.join(frameworks) if frameworks else 'None detected'}\n"

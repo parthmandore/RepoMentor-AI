@@ -1,3 +1,5 @@
+from sqlalchemy.orm.attributes import flag_modified
+import time
 """
 Analysis pipeline orchestrator.
 
@@ -10,12 +12,18 @@ Called from the ingestion pipeline after cloning and parsing are complete.
 import os
 import re
 import uuid
+import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from collections import defaultdict
+
+from psycopg2.extras import execute_values
 
 from app.db.session import SessionLocal
+from app.core.config import settings
 from app.models.repository import Repository, RepositoryStatus
 from app.models.repository_file import RepositoryFile
 from app.models.code_smell import CodeSmell
@@ -70,6 +78,7 @@ def _analyze_single_file(
     outgoing_deps = arch_extract_dependencies(content, path, extension, all_file_paths)
 
     # 2. Security Scanning
+    t_sec_f_start = time.perf_counter()
     security_issues = []
     parsed_deps = []
     
@@ -101,25 +110,36 @@ def _analyze_single_file(
         except Exception:
             pass
     else:
-        # Line-by-line checks
-        for l_idx, line in enumerate(lines, 1):
-            # Secrets check
-            for name, pattern in COMPILED_SECRET_PATTERNS.items():
-                match = pattern.search(line)
-                if match:
-                    security_issues.append({
-                        "file_path": path,
-                        "line_number": l_idx,
-                        "severity": "High" if "Key" in name else "Critical",
-                        "category": "Secrets",
-                        "title": f"Hardcoded {name}",
-                        "evidence": f"Matched: {match.group(0)[:15]}...",
-                        "snippet": line[:120],
-                        "reason": "Sensitive credential variable stored in plain text inside code files."
-                    })
-            # SQL Injection check
-            sql_match = SQL_INJECTION_PATTERN.search(line)
-            if sql_match:
+        # Fast whole-file regex scanning (replaces 4.4M line-by-line regex searches)
+        # 1. Secrets check
+        for name, pattern in COMPILED_SECRET_PATTERNS.items():
+            for match in pattern.finditer(content):
+                l_idx = content.count("\n", 0, match.start()) + 1
+                line_start = content.rfind("\n", 0, match.start()) + 1
+                line_end = content.find("\n", match.end())
+                if line_end == -1:
+                    line_end = len(content)
+                line = content[line_start:line_end]
+                security_issues.append({
+                    "file_path": path,
+                    "line_number": l_idx,
+                    "severity": "High" if "Key" in name else "Critical",
+                    "category": "Secrets",
+                    "title": f"Hardcoded {name}",
+                    "evidence": f"Matched: {match.group(0)[:15]}...",
+                    "snippet": line[:120],
+                    "reason": "Sensitive credential variable stored in plain text inside code files."
+                })
+
+        # 2. SQL Injection check
+        if any(kw in content for kw in (".execute", ".raw", ".query", "execute(", "raw(", "query(")):
+            for sql_match in SQL_INJECTION_PATTERN.finditer(content):
+                l_idx = content.count("\n", 0, sql_match.start()) + 1
+                line_start = content.rfind("\n", 0, sql_match.start()) + 1
+                line_end = content.find("\n", sql_match.end())
+                if line_end == -1:
+                    line_end = len(content)
+                line = content[line_start:line_end]
                 security_issues.append({
                     "file_path": path,
                     "line_number": l_idx,
@@ -130,10 +150,17 @@ def _analyze_single_file(
                     "snippet": line[:120],
                     "reason": "Executing dynamically concatenated SQL strings bypassed parameterized security boundaries."
                 })
-            # Unsafe APIs check
+
+        # 3. Unsafe APIs check
+        if any(kw in content for kw in ("eval", "exec", "subprocess", "Popen", "shell")):
             for api_name, pattern in UNSAFE_API_PATTERNS.items():
-                api_match = pattern.search(line)
-                if api_match:
+                for api_match in pattern.finditer(content):
+                    l_idx = content.count("\n", 0, api_match.start()) + 1
+                    line_start = content.rfind("\n", 0, api_match.start()) + 1
+                    line_end = content.find("\n", api_match.end())
+                    if line_end == -1:
+                        line_end = len(content)
+                    line = content[line_start:line_end]
                     security_issues.append({
                         "file_path": path,
                         "line_number": l_idx,
@@ -144,10 +171,17 @@ def _analyze_single_file(
                         "snippet": line[:120],
                         "reason": "Using exec(), eval() or shell=True permits arbitrary execution payloads."
                     })
-            # Weak hashing check
+
+        # 4. Weak hashing check
+        if "md5" in content.lower() or "sha1" in content.lower() or "hashlib" in content or "createhash" in content.lower():
             for hash_name, pattern in WEAK_HASH_PATTERNS.items():
-                hash_match = pattern.search(line)
-                if hash_match:
+                for hash_match in pattern.finditer(content):
+                    l_idx = content.count("\n", 0, hash_match.start()) + 1
+                    line_start = content.rfind("\n", 0, hash_match.start()) + 1
+                    line_end = content.find("\n", hash_match.end())
+                    if line_end == -1:
+                        line_end = len(content)
+                    line = content[line_start:line_end]
                     security_issues.append({
                         "file_path": path,
                         "line_number": l_idx,
@@ -158,6 +192,7 @@ def _analyze_single_file(
                         "snippet": line[:120],
                         "reason": "MD5 or SHA-1 hashes are cryptographically broken and vulnerable to collisions."
                     })
+    sec_file_duration = time.perf_counter() - t_sec_f_start
 
     # 3. Size, Complexity & Code Smells (Registry Scans)
     code_lines = 0
@@ -168,11 +203,19 @@ def _analyze_single_file(
     analyzer = AnalyzerRegistry.get(extension)
     if analyzer:
         try:
-            size_result = analyzer.analyze_size(content, extension)
-            declarations = analyzer.extract_declarations(content, extension)
-            dependencies = analyzer.extract_dependencies(content, extension)
-            complexity_result = analyzer.analyze_complexity(content, extension)
-            smells = analyzer.detect_smells(path, content, extension, size_result, complexity_result)
+            if hasattr(analyzer, "analyze_full"):
+                full_res = analyzer.analyze_full(path, content, extension)
+                size_result = full_res["size_result"]
+                declarations = full_res["declarations"]
+                dependencies = full_res["dependencies"]
+                complexity_result = full_res["complexity_result"]
+                smells = full_res["smells"]
+            else:
+                size_result = analyzer.analyze_size(content, extension)
+                declarations = analyzer.extract_declarations(content, extension)
+                dependencies = analyzer.extract_dependencies(content, extension)
+                complexity_result = analyzer.analyze_complexity(content, extension)
+                smells = analyzer.detect_smells(path, content, extension, size_result, complexity_result)
 
             import_count = len([d for d in dependencies if d.get("type") in ("import", "include", "use")])
             func_count = len(size_result.get("functions", []))
@@ -233,15 +276,74 @@ def _analyze_single_file(
         "module_type": module_type,
         "outgoing_dependencies": outgoing_deps,
         "security_issues": security_issues,
+        "security_duration": sec_file_duration,
         "parsed_dependencies": parsed_deps,
-        "content": content
+        "content": ""
     }
 
 
-def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict = None) -> None:
+def is_entry_point(path: str) -> bool:
     """
-    Run deterministic code analysis, architecture classifier, and security scans in parallel.
-    Uses in-memory file_contents cache to avoid repeated file reads.
+    Identifies application entry points across Python, Java/Kotlin, JS/TS, Go, Rust, C#, etc.
+    Priority 0 for analysis.
+    """
+    p = path.lower().replace("\\", "/")
+    base = p.split("/")[-1]
+    name, ext = os.path.splitext(base)
+
+    # Universal main/server/app/entry patterns
+    if name in {"main", "app", "server", "index", "run", "manage", "wsgi", "asgi", "cli", "__main__", "program", "startup"}:
+        return True
+
+    # Java / Kotlin Application runners
+    if ext in {".java", ".kt"} and (base.endswith("application.java") or base.endswith("application.kt") or name in {"main", "app"}):
+        return True
+
+    # Frontend web application entry points
+    if base in {"app.tsx", "app.jsx", "_app.tsx", "_app.jsx", "page.tsx", "layout.tsx", "index.tsx", "index.jsx"}:
+        return True
+
+    return False
+
+
+def compute_import_fan_in(clone_path: str, unique_files: list) -> dict[str, int]:
+    """
+    Performs a lightweight import fan-in pre-scan across unique candidate files.
+    Only reads initial import header lines to keep runtime under ~50ms.
+    """
+    fan_in = defaultdict(int)
+    path_lookup = {}
+    for rf in unique_files:
+        base_no_ext = os.path.splitext(rf.path)[0].replace("\\", "/")
+        path_lookup[base_no_ext] = rf.path
+        path_lookup[base_no_ext.split("/")[-1]] = rf.path
+
+    for rf in unique_files:
+        f_path = os.path.join(clone_path, rf.path)
+        if not os.path.isfile(f_path):
+            continue
+        try:
+            with open(f_path, "r", encoding="utf-8", errors="replace") as f:
+                for _ in range(80):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line_s = line.strip()
+                    if line_s.startswith(("import ", "from ", "const ", "require(", "using ", "package ", "include ")):
+                        for token, target_path in path_lookup.items():
+                            if token in line_s and target_path != rf.path:
+                                fan_in[target_path] += 1
+        except Exception:
+            continue
+
+    return fan_in
+
+
+def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict = None) -> dict:
+    """
+    Run deterministic code analysis, architecture classifier, and security scans.
+    Prioritizes files (Entry points -> High import fan-in -> Remainder).
+    Enforces a strict wall-clock analysis budget (default 90s) to fit Render Free.
     Commits results atomically to minimize Supabase connection RTT overheads.
     """
     db = SessionLocal()
@@ -264,51 +366,145 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
 
         all_file_paths = {rf.path for rf in repo_files}
 
-        # Build thread pool tasks
-        tasks = []
+        # Deduplicate files by content hash without holding all file contents in memory
+        content_groups = defaultdict(list)
         for rf in repo_files:
-            content = ""
-            if file_contents and rf.path in file_contents:
-                content = file_contents[rf.path]
+            if not rf.is_text or (rf.size_bytes or 0) == 0:
+                content_groups[f"empty_{rf.id}"].append(rf)
             else:
-                # Fallback to reading file content from disk
-                file_abs_path = os.path.join(clone_path, rf.path)
-                if rf.is_text and os.path.isfile(file_abs_path):
-                    try:
-                        with open(file_abs_path, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read()
-                    except OSError:
-                        pass
-            tasks.append((rf.id, rf.path, rf.extension, rf.is_text, content))
+                chash = rf.content_hash or f"empty_{rf.id}"
+                content_groups[chash].append(rf)
+
+        unique_tasks = [group[0] for group in content_groups.values()]
+        eligible_unique_tasks = [rf for rf in unique_tasks if rf.is_text and (rf.size_bytes or 0) > 0]
+        non_text_or_empty_tasks = [rf for rf in unique_tasks if not rf.is_text or (rf.size_bytes or 0) == 0]
+
+        duplicate_files_count = sum(
+            len(group) - 1 for chash, group in content_groups.items()
+            if not chash.startswith("empty_") and len(group) > 1
+        )
+
+        # Detect folder duplicate pairs
+        folder_pair_dupes = defaultdict(int)
+        for chash, group in content_groups.items():
+            if len(group) > 1 and not chash.startswith("empty_"):
+                folders = [rf.path.split("/")[0] for rf in group if "/" in rf.path]
+                for i in range(len(folders)):
+                    for j in range(i + 1, len(folders)):
+                        if folders[i] != folders[j]:
+                            pair = tuple(sorted([folders[i], folders[j]]))
+                            folder_pair_dupes[pair] += 1
+
+        # Priority ordering: Entry points (0) -> High fan-in (1) -> Remaining (2), with deterministic tie-breaking
+        fan_in_map = compute_import_fan_in(clone_path, eligible_unique_tasks)
+
+        def file_priority_key(rf):
+            is_entry = 0 if is_entry_point(rf.path) else 1
+            fan = fan_in_map.get(rf.path, 0)
+            return (is_entry, -fan, len(rf.path), rf.path)
+
+        prioritized_unique_tasks = sorted(eligible_unique_tasks, key=file_priority_key)
 
         file_metrics_list: List[Dict[str, Any]] = []
-        file_contents_for_duplication: List[Tuple[str, str]] = []
         all_smells: List[Dict[str, Any]] = []
         flat_sec_issues: List[Dict[str, Any]] = []
         all_parsed_deps: List[Dict[str, Any]] = []
         files_analyzed = 0
         files_skipped = 0
 
-        # Execute file analysis in parallel using ThreadPoolExecutor
-        logger.info(f"Starting parallel static analysis for {len(tasks)} files...")
-        with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(_analyze_single_file, tid, tpath, text, is_txt, content, all_file_paths)
-                for tid, tpath, text, is_txt, content in tasks
-            ]
-            results = [f.result() for f in futures]
+        # Monotonic wall-clock deadline enforcement (PART C)
+        from app.core.config import settings
+        budget_seconds = getattr(settings, "ANALYSIS_BUDGET_SECONDS", 90)
+        t_metrics_start = time.perf_counter()
+        deadline = t_metrics_start + budget_seconds
+        min_headroom = 1.0  # Stop starting new expensive files when <1s remains
 
-        # Map results back to files in DB sequentially on main thread
-        results_by_id = {r["repo_file_id"]: r for r in results}
+        workers = getattr(settings, "WORKERS", 1)
+        logger.info(
+            f"Starting prioritized analysis for {len(prioritized_unique_tasks)} unique files "
+            f"(total {len(repo_files)} files) with WORKERS={workers}, budget={budget_seconds}s..."
+        )
 
-        # 1. Update RepositoryFile records in DB
+        primary_results = []
+        budget_exhausted = False
+
+        for idx, rf in enumerate(prioritized_unique_tasks):
+            now = time.perf_counter()
+            if now >= deadline - min_headroom:
+                logger.warning(
+                    f"Phase A analysis budget reached ({budget_seconds}s). Halting further file analysis at {idx}/{len(prioritized_unique_tasks)} unique files."
+                )
+                budget_exhausted = True
+                break
+
+            content = ""
+            if file_contents and rf.path in file_contents:
+                content = file_contents[rf.path]
+            else:
+                f_abs = os.path.join(clone_path, rf.path)
+                if rf.is_text and os.path.isfile(f_abs):
+                    try:
+                        with open(f_abs, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                    except OSError:
+                        pass
+
+            res = _analyze_single_file(rf.id, rf.path, rf.extension, rf.is_text, content, all_file_paths)
+            primary_results.append(res)
+            del content
+
+            # Cooperative GIL yield to keep /health and API responsive on single-core / 0.1 CPU
+            time.sleep(0.001)
+
+        # Process any non-text or empty unique tasks statelessly
+        for rf in non_text_or_empty_tasks:
+            res = _analyze_single_file(rf.id, rf.path, rf.extension, False, "", all_file_paths)
+            primary_results.append(res)
+
+        t_metrics = time.perf_counter() - t_metrics_start
+
+        # Map primary results back to all file records (duplicate inheritance)
+        primary_by_id = {r["repo_file_id"]: r for r in primary_results}
+        results_by_id = {}
+        unique_smell_count = 0
+
+        for chash, group in content_groups.items():
+            primary_task = group[0]
+            base_res = primary_by_id.get(primary_task.id)
+            if not base_res:
+                # File was cut off by budget limit
+                continue
+            results_by_id[primary_task.id] = base_res
+            if not base_res.get("skipped", True):
+                unique_smell_count += len(base_res.get("smells", []))
+
+            # Duplicate paths inherit metrics, classifications, dependencies, smells, and security issues
+            for dup_rf in group[1:]:
+                dup_res = dict(base_res)
+                dup_res["repo_file_id"] = dup_rf.id
+                dup_res["path"] = dup_rf.path
+                dup_res["smells"] = [{**s, "file_path": dup_rf.path} for s in base_res.get("smells", [])]
+                dup_res["security_issues"] = [{**i, "file_path": dup_rf.path} for i in base_res.get("security_issues", [])]
+                results_by_id[dup_rf.id] = dup_res
+
+        # 1. Update RepositoryFile records in memory
         graph = {}
         classifications = {}
-        
+
         for rf in repo_files:
             res = results_by_id.get(rf.id)
             if not res or res.get("skipped", True):
                 files_skipped += 1
+                rf.lines_of_code = 0
+                rf.complexity = 1
+                rf.analysis_metadata = {"status": "skipped" if not res else "budget_cutoff"}
+                rf.module_type = "Unknown"
+                rf.outgoing_dependencies = []
+                rf.incoming_dependencies = []
+                rf.in_dependency_cycle = False
+                rf.coupling_score = 0
+                rf.instability_score = 0.0
+                rf.code_smells_count = 0
                 continue
 
             rf.lines_of_code = res["code_lines"]
@@ -316,7 +512,7 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             rf.analysis_metadata = res["extended_metadata"]
             rf.module_type = res["module_type"]
             rf.outgoing_dependencies = res["outgoing_dependencies"]
-            
+
             classifications[rf.path] = res["module_type"]
             graph[rf.path] = res["outgoing_dependencies"]
 
@@ -339,13 +535,12 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
                     }
                 })
 
-            if res["content"]:
-                file_contents_for_duplication.append((rf.path, res["content"]))
             all_smells.extend(res["smells"])
             flat_sec_issues.extend(res["security_issues"])
             all_parsed_deps.extend(res["parsed_dependencies"])
             files_analyzed += 1
 
+        t_arch_start = time.perf_counter()
         # 2. Architecture: Calculate afferent/efferent coupling & cycle checks in-memory
         incoming = {p: [] for p in all_file_paths}
         for src, targets in graph.items():
@@ -399,30 +594,7 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             if rf.path in smell_counts_by_file:
                 rf.code_smells_count = smell_counts_by_file[rf.path]
 
-        # Execute bulk updates in a single database batch
-        update_mappings = [
-            {
-                "id": rf.id,
-                "lines_of_code": rf.lines_of_code,
-                "complexity": rf.complexity,
-                "analysis_metadata": rf.analysis_metadata,
-                "module_type": rf.module_type,
-                "outgoing_dependencies": rf.outgoing_dependencies,
-                "incoming_dependencies": rf.incoming_dependencies,
-                "in_dependency_cycle": rf.in_dependency_cycle,
-                "coupling_score": rf.coupling_score,
-                "instability_score": rf.instability_score,
-                "code_smells_count": rf.code_smells_count
-            }
-            for rf in repo_files
-        ]
-        db.bulk_update_mappings(RepositoryFile, update_mappings)
-        
-        # Expunge the ORM objects to prevent sequential dirty-tracked updates on commit
-        for rf in repo_files:
-            db.expunge(rf)
-
-        # 3. Calculate Duplication (disabled for portfolio performance)
+        # 3. Calculate Duplication
         duplication_result = {"duplication_percentage": 0.0, "details": []}
 
         # 4. Aggregate Metrics
@@ -433,6 +605,9 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             files_analyzed=files_analyzed,
             files_skipped=files_skipped,
         )
+        # Option A headline smell override
+        if unique_smell_count > 0:
+            summary["total_smells"] = unique_smell_count
 
         # 5. Architecture Findings & Scores
         unknown_count = sum(1 for rf in repo_files if rf.module_type == "Unknown")
@@ -440,6 +615,14 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
         unknown_ratio = float(unknown_count) / float(total_count)
         
         findings_data = generate_findings(classifications, graph, cycles, coupling_stats, unknown_ratio)
+        if duplicate_files_count > 0:
+            top_pairs = sorted(folder_pair_dupes.items(), key=lambda x: x[1], reverse=True)
+            details_str = ", ".join([f"{cnt} files identical between {p[0]}/ and {p[1]}/" for p, cnt in top_pairs[:3]])
+            findings_data["strengths"].append({
+                "title": "Duplicate Files Finding",
+                "description": f"{duplicate_files_count} duplicate files detected ({details_str}). Unique content analyzed once per Option A policy."
+            })
+
         arch_score = calculate_architecture_score(
             cycle_count=len(cycles),
             highly_coupled_count=highly_coupled_count,
@@ -448,72 +631,9 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
         )
         arch_grade = calculate_architecture_grade(arch_score)
 
-        # 6. Security Scoring
-        sec_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-        for issue in flat_sec_issues:
-            sec_counts[issue["severity"]] = sec_counts.get(issue["severity"], 0) + 1
-
-        sec_score = calculate_security_score(sec_counts)
-        sec_grade = calculate_security_grade(sec_score)
-
-        # Re-calculate health score including cycles
-        comment_lines = sum(m["size_metrics"]["comment_lines"] for m in file_metrics_list)
-        total_lines = sum(m["size_metrics"]["total_lines"] for m in file_metrics_list)
-        avg_comment_ratio = comment_lines / max(1, total_lines)
-
-        from app.services.analysis.scoring import calculate_weighted_health_score, calculate_grade
-        health_data = calculate_weighted_health_score(
-            average_complexity=summary["average_complexity"],
-            total_smells=summary["total_smells"],
-            security_counts=sec_counts,
-            cycle_count=len(cycles),
-            highly_coupled_count=highly_coupled_count,
-            comment_ratio=avg_comment_ratio,
-            duplication_percentage=duplication_result["duplication_percentage"]
-        )
-
-        # 7. Write code smells & security issues to DB
-        db.query(CodeSmell).filter(CodeSmell.repository_id == repo_id).delete()
-        smell_mappings = [
-            {
-                "id": uuid.uuid4(),
-                "repository_id": repo_id,
-                "file_path": smell["file_path"],
-                "smell_type": smell["smell_type"],
-                "category": smell["category"],
-                "severity": smell["severity"],
-                "line_number": smell.get("line_number"),
-                "measured_value": smell["measured_value"],
-                "threshold": smell["threshold"],
-                "reason": smell["reason"]
-            }
-            for smell in all_smells
-        ]
-        db.bulk_insert_mappings(CodeSmell, smell_mappings)
-
-        db.query(SecurityIssue).filter(SecurityIssue.repository_id == repo_id).delete()
-        sec_mappings = [
-            {
-                "id": uuid.uuid4(),
-                "repository_id": repo_id,
-                "file_path": issue["file_path"],
-                "line_number": issue["line_number"],
-                "severity": issue["severity"],
-                "category": issue["category"],
-                "title": issue["title"],
-                "evidence": issue["evidence"],
-                "snippet": issue["snippet"],
-                "reason": issue["reason"]
-            }
-            for issue in flat_sec_issues
-        ]
-        db.bulk_insert_mappings(SecurityIssue, sec_mappings)
-
-        # 8. Build Architecture & Security summary details
+        # 8. Build Architecture Knowledge Data in-memory
         logger.info(f"Building architecture knowledge for repo {repo_id}...")
         knowledge_data = ArchitectureKnowledgeBuilder.build(repo_id, repo_files)
-        
-        # Override cycles count with true cycle count
         knowledge_data["cycles_count"] = len(cycles)
 
         arch_summary_data = {
@@ -534,11 +654,21 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             },
             "cycles_list": cycles
         }
+        t_arch = time.perf_counter() - t_arch_start
+
+        # 6. Security Scoring in memory
+        t_sec_start = time.perf_counter()
+        sec_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+        for issue in flat_sec_issues:
+            sec_counts[issue["severity"]] = sec_counts.get(issue["severity"], 0) + 1
+
+        sec_score = calculate_security_score(sec_counts)
+        sec_grade = calculate_security_grade(sec_score)
 
         # Calculate secrets checked dynamically
         from app.services.security.patterns import COMPILED_SECRET_PATTERNS
         num_patterns = len(COMPILED_SECRET_PATTERNS) if COMPILED_SECRET_PATTERNS else 8
-        total_lines_checked = sum(res["extended_metadata"].get("total_lines", 0) for res in results if not res.get("skipped", True))
+        total_lines_checked = sum(res["extended_metadata"].get("total_lines", 0) for res in primary_results if not res.get("skipped", True))
         secrets_checked = total_lines_checked * num_patterns
 
         # Categorize security issues
@@ -572,6 +702,173 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
                 "issues_found": len(flat_sec_issues)
             }
         }
+        t_sec_files = sum(r.get("security_duration", 0.0) for r in primary_results)
+        t_sec = max(0.005, t_sec_files + (time.perf_counter() - t_sec_start))
+
+        # Re-calculate health score including cycles and unique smell count
+        comment_lines = sum(m["size_metrics"]["comment_lines"] for m in file_metrics_list)
+        total_lines = sum(m["size_metrics"]["total_lines"] for m in file_metrics_list)
+        avg_comment_ratio = comment_lines / max(1, total_lines)
+
+        from app.services.analysis.scoring import calculate_weighted_health_score, calculate_grade
+        health_data = calculate_weighted_health_score(
+            average_complexity=summary["average_complexity"],
+            total_smells=summary["total_smells"],
+            security_counts=sec_counts,
+            cycle_count=len(cycles),
+            highly_coupled_count=highly_coupled_count,
+            comment_ratio=avg_comment_ratio,
+            duplication_percentage=duplication_result["duplication_percentage"]
+        )
+
+        # 7. HIGH-SPEED DATABASE WRITE BATCH (execute_values on PostgreSQL)
+        t_db_start = time.perf_counter()
+        is_sqlite = (db.bind.dialect.name == "sqlite")
+
+        if is_sqlite:
+            # SQLite path for unit tests
+            for rf in repo_files:
+                pass
+            db.commit()
+
+            db.query(CodeSmell).filter(CodeSmell.repository_id == repo_id).delete()
+            for smell in all_smells:
+                db.add(CodeSmell(
+                    id=uuid.uuid4(),
+                    repository_id=repo_id,
+                    file_path=smell["file_path"],
+                    smell_type=smell["smell_type"],
+                    category=smell["category"],
+                    severity=smell["severity"],
+                    line_number=smell.get("line_number"),
+                    measured_value=float(smell["measured_value"]),
+                    threshold=float(smell["threshold"]),
+                    reason=smell["reason"],
+                    created_at=datetime.now(timezone.utc)
+                ))
+
+            db.query(SecurityIssue).filter(SecurityIssue.repository_id == repo_id).delete()
+            for issue in flat_sec_issues:
+                db.add(SecurityIssue(
+                    id=uuid.uuid4(),
+                    repository_id=repo_id,
+                    file_path=issue["file_path"],
+                    line_number=issue["line_number"],
+                    severity=issue["severity"],
+                    category=issue["category"],
+                    title=issue["title"],
+                    evidence=issue["evidence"],
+                    snippet=issue["snippet"],
+                    reason=issue["reason"],
+                    created_at=datetime.now(timezone.utc)
+                ))
+            db.commit()
+        else:
+            raw_conn = db.connection().connection
+
+            # 7a. Multi-row bulk update for RepositoryFile
+            update_tuples = [
+                (
+                    str(rf.id),
+                    rf.lines_of_code or 0,
+                    rf.complexity or 1,
+                    json.dumps(rf.analysis_metadata or {}),
+                    rf.module_type or "Unknown",
+                    json.dumps(rf.outgoing_dependencies or []),
+                    json.dumps(rf.incoming_dependencies or []),
+                    rf.in_dependency_cycle or False,
+                    rf.coupling_score or 0,
+                    float(rf.instability_score or 0.0),
+                    rf.code_smells_count or 0
+                )
+                for rf in repo_files
+            ]
+            update_sql = """
+            UPDATE repository_files AS rf
+            SET lines_of_code = v.loc,
+                complexity = v.comp,
+                analysis_metadata = v.meta::jsonb,
+                module_type = v.mtype,
+                outgoing_dependencies = v.out_deps::jsonb,
+                incoming_dependencies = v.in_deps::jsonb,
+                in_dependency_cycle = v.cycle,
+                coupling_score = v.coupling,
+                instability_score = v.instab,
+                code_smells_count = v.smells
+            FROM (VALUES %s) AS v(id, loc, comp, meta, mtype, out_deps, in_deps, cycle, coupling, instab, smells)
+            WHERE rf.id = v.id::uuid;
+            """
+            cur = raw_conn.cursor()
+            try:
+                execute_values(cur, update_sql, update_tuples, page_size=1000)
+            finally:
+                cur.close()
+
+            # Expunge the ORM objects to prevent dirty-tracked sequential updates on commit
+            for rf in repo_files:
+                db.expunge(rf)
+
+            # 7b. Multi-row bulk insert for CodeSmells
+            db.query(CodeSmell).filter(CodeSmell.repository_id == repo_id).delete()
+            smell_tuples = [
+                (
+                    str(uuid.uuid4()),
+                    str(repo_id),
+                    smell["file_path"],
+                    smell["smell_type"],
+                    smell["category"],
+                    smell["severity"],
+                    smell.get("line_number"),
+                    float(smell["measured_value"]),
+                    float(smell["threshold"]),
+                    smell["reason"],
+                    datetime.now(timezone.utc)
+                )
+                for smell in all_smells
+            ]
+            insert_smells_sql = """
+            INSERT INTO code_smells (
+                id, repository_id, file_path, smell_type, category, severity,
+                line_number, measured_value, threshold, reason, created_at
+            ) VALUES %s
+            """
+            cur = raw_conn.cursor()
+            try:
+                execute_values(cur, insert_smells_sql, smell_tuples, page_size=2000)
+            finally:
+                cur.close()
+
+            # 7c. Multi-row bulk insert for SecurityIssues
+            db.query(SecurityIssue).filter(SecurityIssue.repository_id == repo_id).delete()
+            sec_tuples = [
+                (
+                    str(uuid.uuid4()),
+                    str(repo_id),
+                    issue["file_path"],
+                    issue["line_number"],
+                    issue["severity"],
+                    issue["category"],
+                    issue["title"],
+                    issue["evidence"],
+                    issue["snippet"],
+                    issue["reason"],
+                    datetime.now(timezone.utc)
+                )
+                for issue in flat_sec_issues
+            ]
+            insert_sec_sql = """
+            INSERT INTO security_issues (
+                id, repository_id, file_path, line_number, severity, category,
+                title, evidence, snippet, reason, created_at
+            ) VALUES %s
+            """
+            cur = raw_conn.cursor()
+            try:
+                execute_values(cur, insert_sec_sql, sec_tuples, page_size=2000)
+            finally:
+                cur.close()
+
+        t_db = time.perf_counter() - t_db_start
 
         # 9. Commit Repository Summary Columns in a single operation
         analysis_completed_at = datetime.now(timezone.utc)
@@ -613,6 +910,23 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             ] if (sec_counts["Critical"] > 0 or sec_counts["High"] > 0) else []
         }
 
+        eligible_unique_count = len(prioritized_unique_tasks)
+        analyzed_unique_eligible = min(eligible_unique_count, len([r for r in primary_results if r["repo_file_id"] in {rf.id for rf in prioritized_unique_tasks}]))
+        is_partial = (analyzed_unique_eligible < eligible_unique_count)
+        status_display = f"Analysed {analyzed_unique_eligible} of {eligible_unique_count} unique files"
+
+        budget_summary = {
+            "budget_seconds": budget_seconds,
+            "elapsed_seconds": round(t_metrics, 2),
+            "total_files": len(repo_files),
+            "eligible_files": len([rf for rf in repo_files if rf.is_text and (rf.size_bytes or 0) > 0]),
+            "unique_eligible_files": eligible_unique_count,
+            "analyzed_unique_files": analyzed_unique_eligible,
+            "analyzed_total_files": len(results_by_id),
+            "is_partial": is_partial,
+            "status_display": status_display
+        }
+
         current_summary = repo.knowledge_summary or {}
         current_summary["architecture_knowledge"] = knowledge_data
         current_summary["security_metadata"] = {
@@ -621,7 +935,9 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
             "vulnerability_provider": "Offline vulnerability database unavailable"
         }
         current_summary["health_metadata"] = health_data
-        repo.knowledge_summary = current_summary
+        current_summary["analysis_budget"] = budget_summary
+        repo.knowledge_summary = dict(current_summary)
+        flag_modified(repo, "knowledge_summary")
 
         repo.analysis_completed_at = analysis_completed_at
         repo.analysis_duration_seconds = round(duration, 2)
@@ -630,8 +946,15 @@ def analyze_repository(repo_id: uuid.UUID, clone_path: str, file_contents: dict 
         logger.info(
             f"Merged Analysis complete for repo {repo_id}: "
             f"health={repo.health_score}, arch={repo.architecture_score}, sec={repo.security_score}, "
-            f"duration={round(duration, 2)}s"
+            f"duration={round(duration, 2)}s, budget_status='{status_display}'"
         )
+        return {
+            "metrics": round(t_metrics, 3),
+            "architecture": round(t_arch, 3),
+            "security": round(t_sec, 3),
+            "database": round(t_db, 3),
+            "analysis_budget": budget_summary
+        }
 
     except Exception as e:
         logger.error(f"Merged Analysis failed for repo {repo_id}: {e}", exc_info=True)

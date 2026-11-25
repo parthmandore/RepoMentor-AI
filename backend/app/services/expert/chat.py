@@ -23,7 +23,6 @@ class ChatManager:
         self.db.add(session)
         try:
             self.db.commit()
-            self.db.refresh(session)
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to create chat session: {e}")
@@ -71,14 +70,14 @@ class ChatManager:
         self.db.add(msg)
         try:
             self.db.commit()
-            self.db.refresh(msg)
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to add chat message: {e}")
             raise e
 
-        # Trigger automatic summarization if conversation length grows long
-        self.check_and_summarize(session_id)
+        # Trigger automatic summarization only after assistant responses, never blocking user input
+        if role == "assistant":
+            self.check_and_summarize(session_id)
 
         return msg
 

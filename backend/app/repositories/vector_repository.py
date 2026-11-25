@@ -5,6 +5,7 @@ import time
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from psycopg2.extras import execute_values
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,24 @@ class VectorRepository:
             """))
             self.db.commit()
             logger.info(f"pgvector table 'repository_embeddings' with vector({dimension}) verified/created successfully.")
+
+            # Verify dimension matches if table already existed
+            dim_check = self.db.execute(text("""
+                SELECT atttypmod 
+                FROM pg_attribute 
+                WHERE attrelid = 'repository_embeddings'::regclass AND attname = 'embedding';
+            """)).scalar()
+            if dim_check is not None and dim_check != dimension:
+                logger.warning(f"Vector dimension mismatch (found {dim_check}, expected {dimension}). Altering column...")
+                self.db.execute(text("DROP INDEX IF EXISTS repository_embeddings_hnsw_idx;"))
+                self.db.execute(text(f"ALTER TABLE repository_embeddings ALTER COLUMN embedding TYPE vector({dimension}) USING NULL;"))
+                self.db.execute(text("""
+                    CREATE INDEX IF NOT EXISTS repository_embeddings_hnsw_idx 
+                    ON repository_embeddings 
+                    USING hnsw (embedding vector_cosine_ops);
+                """))
+                self.db.commit()
+                logger.info(f"Successfully migrated embedding column to vector({dimension}).")
         except Exception as e:
             self.db.rollback()
             logger.error(f"Failed to verify/create pgvector table or indexes: {e}")
@@ -79,32 +98,40 @@ class VectorRepository:
 
         insert_sql = """
         INSERT INTO repository_embeddings (
-            repository_id, chunk_id, document_id, file_path, start_line, end_line, chunk_type, source_phase, content, metadata, embedding
+            repository_id, chunk_id, document_id, file_path, start_line, end_line, chunk_type, source_phase, content, metadata, embedding, embedding_model, embedding_dim
         ) VALUES %s
         ON CONFLICT (chunk_id) DO UPDATE SET
             content = EXCLUDED.content,
             metadata = EXCLUDED.metadata,
-            embedding = EXCLUDED.embedding
+            embedding = EXCLUDED.embedding,
+            embedding_model = EXCLUDED.embedding_model,
+            embedding_dim = EXCLUDED.embedding_dim
         """
         
         inserted = 0
         try:
             # Build tuple list for execute_values
+            emb_model_default = getattr(settings, "EMBEDDING_MODEL", "text-embedding-004")
+            emb_dim_default = getattr(settings, "EMBEDDING_DIMENSION", 768)
             values_list = []
             for chunk, emb in zip(chunks, embeddings):
-                emb_str = str(emb).replace(" ", "")
+                emb_str = str(emb).replace(" ", "") if emb is not None else None
+                emb_model = chunk.get("embedding_model", emb_model_default) if emb is not None else None
+                emb_dim = chunk.get("embedding_dim", emb_dim_default) if emb is not None else None
                 values_list.append((
                     str(repository_id),
                     chunk["chunk_id"],
                     chunk["document_id"],
                     chunk["file_path"],
-                    chunk.get("start_line", 1),
-                    chunk.get("end_line", 1),
+                    chunk.get("start_line"),
+                    chunk.get("end_line"),
                     chunk.get("chunk_type", "Block"),
                     chunk.get("source_phase", "Unknown"),
                     chunk["content"],
                     json.dumps(chunk.get("metadata", {})),
-                    emb_str
+                    emb_str,
+                    emb_model,
+                    emb_dim
                 ))
                 
             # Use raw psycopg2 connection to call execute_values directly
@@ -120,7 +147,7 @@ class VectorRepository:
                 cursor,
                 insert_sql,
                 values_list,
-                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector)",
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s, %s)",
                 page_size=500
             )
             inserted = len(values_list)
@@ -276,8 +303,147 @@ class VectorRepository:
                 })
             return grounded_chunks
         except Exception as e:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
             logger.error(f"Similarity search query failed on pgvector: {e}")
             return []
+
+    def search_keyword_chunks(self, repository_id: uuid.UUID, query_text: str, limit: int = 10) -> list[dict]:
+        """
+        Performs PostgreSQL Full-Text Keyword Search with OR semantics and identifier tokenization
+        using the GIN index on repository_embeddings.
+        Deterministic tie-break by rank_score DESC, id ASC.
+        """
+        import re
+        s1 = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', query_text)
+        s2 = re.sub(r'[_/\-.:]', ' ', s1)
+        s3 = re.sub(r'[^\w\s]', ' ', s2)
+        raw_tokens = [t.strip().lower() for t in s3.split() if len(t.strip()) > 1]
+        stopwords = {
+            "where", "does", "the", "in", "is", "of", "and", "or", "to", "what", "how",
+            "are", "there", "any", "two", "do", "for", "with", "can", "an", "as", "by"
+        }
+        filtered = [t for t in raw_tokens if t not in stopwords] or raw_tokens
+        clean_tokens = [re.sub(r'[^a-zA-Z0-9]', '', t) for t in filtered if len(re.sub(r'[^a-zA-Z0-9]', '', t)) > 1]
+        
+        if clean_tokens:
+            tsquery_str = " | ".join(clean_tokens)
+            query = """
+            SELECT 
+                chunk_id, document_id, file_path, start_line, end_line, chunk_type, source_phase, content, metadata,
+                ts_rank_cd(to_tsvector('english', content), to_tsquery('english', :query_text)) AS rank_score
+            FROM repository_embeddings
+            WHERE repository_id = :repository_id
+              AND to_tsvector('english', content) @@ to_tsquery('english', :query_text)
+            ORDER BY rank_score DESC, id ASC
+            LIMIT :limit
+            """
+        else:
+            tsquery_str = query_text
+            query = """
+            SELECT 
+                chunk_id, document_id, file_path, start_line, end_line, chunk_type, source_phase, content, metadata,
+                ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', :query_text)) AS rank_score
+            FROM repository_embeddings
+            WHERE repository_id = :repository_id
+              AND to_tsvector('english', content) @@ plainto_tsquery('english', :query_text)
+            ORDER BY rank_score DESC, id ASC
+            LIMIT :limit
+            """
+        try:
+            res = self.db.execute(
+                text(query),
+                {
+                    "repository_id": repository_id,
+                    "query_text": tsquery_str,
+                    "limit": limit
+                }
+            )
+            keyword_chunks = []
+            for row in res:
+                rank_score = round(float(row[9]), 4) if row[9] is not None else 0.0
+                start_l = int(row[3]) if row[3] is not None else None
+                end_l = int(row[4]) if row[4] is not None else None
+                line_str = f"{start_l}-{end_l}" if start_l is not None and end_l is not None else None
+                keyword_chunks.append({
+                    "similarity_score": rank_score,
+                    "source_type": row[5] or "Code",
+                    "file_path": row[2],
+                    "line_numbers": line_str,
+                    "evidence_type": row[5] or "Block",
+                    "chunk_type": row[5] or "Block",
+                    "content": row[7],
+                    "start_line": start_l,
+                    "end_line": end_l,
+                    "metadata": {
+                        "chunk_id": row[0],
+                        "document_id": row[1],
+                        "repo_id": str(repository_id),
+                        "source_phase": row[6],
+                        "document_type": row[5],
+                        "file_path": row[2],
+                        "chunk_type": row[5],
+                        "start_line": start_l,
+                        "end_line": end_l,
+                        **(row[8] or {})
+                    }
+                })
+            return keyword_chunks
+        except Exception as e:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            logger.error(f"Keyword search query failed on Postgres: {e}")
+            return []
+
+    def search_hybrid(
+        self,
+        repository_id: uuid.UUID,
+        query_text: str,
+        query_vector: list[float],
+        limit: int = 6,
+        rrf_k: int = 60
+    ) -> list[dict]:
+        """
+        Hybrid search combining pgvector cosine similarity and PostgreSQL full-text search.
+        Merges results using Reciprocal Rank Fusion (RRF):
+            Score(d) = sum(1 / (rrf_k + rank_i(d)))
+        Deterministic tie-break: order by score DESC, chunk_id ASC.
+        """
+        candidate_limit = max(10, limit * 2)
+        vector_results = self.search_similar_chunks(repository_id, query_vector, limit=candidate_limit)
+        keyword_results = self.search_keyword_chunks(repository_id, query_text, limit=candidate_limit)
+        
+        scores: dict[str, float] = {}
+        chunks_by_id: dict[str, dict] = {}
+        
+        # Rank from vector results
+        for rank, chunk in enumerate(vector_results, start=1):
+            cid = chunk["metadata"]["chunk_id"]
+            chunks_by_id[cid] = chunk
+            scores[cid] = scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+            
+        # Rank from keyword results
+        for rank, chunk in enumerate(keyword_results, start=1):
+            cid = chunk["metadata"]["chunk_id"]
+            if cid not in chunks_by_id:
+                chunks_by_id[cid] = chunk
+            # Exact keyword match receives a 1.25x weight in RRF
+            scores[cid] = scores.get(cid, 0.0) + (1.25 / (rrf_k + rank))
+            
+        # Sort merged candidate pool by combined RRF score DESC, chunk_id ASC
+        sorted_ids = sorted(scores.keys(), key=lambda cid: (-scores[cid], str(cid)))
+        merged = []
+        for cid in sorted_ids[:limit]:
+            ch = chunks_by_id[cid]
+            ch["rrf_score"] = round(scores[cid], 5)
+            ch["similarity_score"] = min(1.0, max(ch.get("similarity_score", 0.0), round(scores[cid] * 30.0, 4)))
+            merged.append(ch)
+            
+        return merged
 
     def fetch_neighbor_chunks(self, repository_id: uuid.UUID, file_path: str) -> list[dict]:
         """

@@ -2,50 +2,104 @@ import os
 import hashlib
 from typing import Dict, List, Tuple
 
-# Folders to skip during parsing
+# Folders to skip during parsing (Quick mode & Production filters)
 SKIP_FOLDERS = {
     ".git", "node_modules", "build", "dist", "vendor", "__pycache__", ".next",
-    ".vscode", ".idea", "out", "target", "bin", "obj", "coverage", ".svelte-kit", ".nuxt"
+    ".vscode", ".idea", "out", "target", "bin", "obj", "coverage", ".svelte-kit", ".nuxt",
+    "fixtures", "__fixtures__", "mocks", "__mocks__", "test", "tests", "__tests__",
+    "spec", "specs", "playground", "site-packages", ".turbo"
+}
+
+# Common lockfiles and generated dependency manifests to ignore for raw parsing
+SKIP_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "cargo.lock", "poetry.lock", "mix.lock", "pipfile.lock"
+}
+
+# Binary and non-source extensions to skip
+SKIP_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".mp4", ".zip",
+    ".tar.gz", ".tar", ".gz", ".rar", ".7z", ".pdf", ".woff", ".woff2", ".ttf",
+    ".eot", ".otf", ".exe", ".dll", ".so", ".dylib", ".class", ".pyc", ".pyo",
+    ".db", ".sqlite", ".war", ".ear", ".jar", ".map", ".css", ".scss",
+    ".sass", ".less", ".wav", ".mp3", ".ogg", ".flac", ".aac", ".m4a",
+    ".webm", ".avi", ".mov", ".mkv", ".bmp", ".tiff", ".webp", ".avif", ".iso"
 }
 
 def is_text_file(file_path: str) -> bool:
-    """Detects if a file is a text file by reading the first 1024 bytes and checking for null bytes."""
+    """Detects if a file is a text file by reading the initial bytes and checking for null bytes."""
     try:
         with open(file_path, "rb") as f:
-            chunk = f.read(1024)
+            chunk = f.read(4096)
             if b"\x00" in chunk:
                 return False
             try:
                 chunk.decode("utf-8")
                 return True
             except UnicodeDecodeError:
-                # Fallback check for Latin-1 (commonly used in legacy text files)
-                chunk.decode("latin-1")
-                return True
+                # Fallback check for Latin-1
+                try:
+                    chunk.decode("latin-1")
+                    return True
+                except UnicodeDecodeError:
+                    return False
     except Exception:
         return False
 
 def calculate_sha256(file_path: str) -> str:
-    """Computes the SHA-256 hash of a file's content in chunks to preserve memory."""
+    """Computes the SHA-256 hash of a file's content in 64KB chunks to preserve memory."""
     sha256 = hashlib.sha256()
     try:
         with open(file_path, "rb") as f:
-            while chunk := f.read(8192):
+            while chunk := f.read(65536):
                 sha256.update(chunk)
         return sha256.hexdigest()
     except Exception:
         return "unknown_hash"
 
+def inspect_file_stream(file_path: str) -> Tuple[str, bool]:
+    """
+    Streamingly calculates SHA-256 hash and determines if the file is text.
+    Keeps memory allocation bounded to a single 64KB buffer.
+    """
+    sha256 = hashlib.sha256()
+    is_txt = False
+    try:
+        with open(file_path, "rb") as f:
+            first_chunk = f.read(4096)
+            if not first_chunk:
+                return sha256.hexdigest(), False
+
+            if b"\x00" not in first_chunk:
+                try:
+                    first_chunk.decode("utf-8")
+                    is_txt = True
+                except UnicodeDecodeError:
+                    try:
+                        first_chunk.decode("latin-1")
+                        is_txt = True
+                    except UnicodeDecodeError:
+                        is_txt = False
+
+            sha256.update(first_chunk)
+            while chunk := f.read(65536):
+                sha256.update(chunk)
+
+        return sha256.hexdigest(), is_txt
+    except Exception:
+        return "unknown_hash", False
+
 def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
     """
-    Walks the cloned repository structure, compiles structural statistics, and reads text contents.
+    Walks the cloned repository structure and compiles structural statistics.
+    Processes files individually and streamingly without retaining full contents in memory.
+
     Returns:
-      - List of file metadata dicts
+      - List of file metadata dicts (path, extension, size_bytes, content_hash, is_text)
       - Dict containing statistics (total_files, total_folders, text_file_count, binary_file_count)
-      - Dict of relative paths mapping to text content string
+      - Empty dict for backward compatibility (file contents are read on-demand during analysis)
     """
     files_metadata = []
-    file_contents = {}
     
     total_files = 0
     total_folders = 0
@@ -58,7 +112,7 @@ def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
         # Skip forbidden/generated directories in-place
         dirnames[:] = [d for d in dirnames if d not in SKIP_FOLDERS]
         
-        # Count current directory as a folder (excluding the root directory itself)
+        # Count current directory as a folder (excluding root directory itself)
         if dirpath != root_path:
             total_folders += 1
             
@@ -66,7 +120,6 @@ def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
             file_path = os.path.join(dirpath, filename)
             rel_path = os.path.relpath(file_path, root_path).replace("\\", "/")
             
-            size_bytes = 0
             try:
                 size_bytes = os.path.getsize(file_path)
             except OSError:
@@ -75,44 +128,17 @@ def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
             _, ext = os.path.splitext(filename)
             ext = ext.lower() if ext else ""
 
-            # Skip lock files, compiled binaries, media, archives, and web assets
+            # Skip lock files, web assets, minified bundles, and binary formats
             filename_lower = filename.lower()
-            if filename_lower in {
-                "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
-                "cargo.lock", "poetry.lock", "mix.lock", "pipfile.lock"
-            }:
+            if filename_lower in SKIP_FILENAMES or ext in SKIP_EXTENSIONS or ".min." in filename_lower or "-min." in filename_lower:
                 continue
 
-            if ext in {
-                ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".mp4", ".zip",
-                ".tar.gz", ".tar", ".gz", ".rar", ".pdf", ".woff", ".woff2", ".ttf",
-                ".eot", ".exe", ".dll", ".so", ".dylib", ".class", ".pyc", ".pyo",
-                ".db", ".sqlite", ".war", ".ear", ".jar", ".map", ".css", ".scss",
-                ".sass", ".less"
-            }:
-                continue
-
-            is_txt = False
-            content_str = ""
             content_hash = "unknown_hash"
-            
+            is_txt = False
+
+            # Bounded stream processing: hash and detect text in 64KB chunks
             if size_bytes < 10 * 1024 * 1024:  # Under 10MB limit
-                try:
-                    with open(file_path, "rb") as f:
-                        raw_data = f.read()
-                    content_hash = hashlib.sha256(raw_data).hexdigest()
-                    if b"\x00" not in raw_data[:1024]:
-                        try:
-                            content_str = raw_data.decode("utf-8")
-                            is_txt = True
-                        except UnicodeDecodeError:
-                            try:
-                                content_str = raw_data.decode("latin-1")
-                                is_txt = True
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                content_hash, is_txt = inspect_file_stream(file_path)
 
             files_metadata.append({
                 "path": rel_path,
@@ -123,7 +149,6 @@ def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
             })
 
             if is_txt:
-                file_contents[rel_path] = content_str
                 text_file_count += 1
             else:
                 binary_file_count += 1
@@ -137,4 +162,5 @@ def parse_repository(root_path: str) -> Tuple[List[Dict], Dict, Dict[str, str]]:
         "binary_file_count": binary_file_count
     }
 
-    return files_metadata, stats, file_contents
+    # file_contents dict is returned empty: downstream stages read on demand or stream
+    return files_metadata, stats, {}

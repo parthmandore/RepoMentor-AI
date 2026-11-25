@@ -1,4 +1,3 @@
-import requests
 from fastapi import APIRouter, Depends, status, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -8,7 +7,27 @@ from app.core.config import settings
 router = APIRouter()
 
 @router.get("/health")
-def check_health(response: Response, db: Session = Depends(get_db)):
+def check_health(db: Session = Depends(get_db)):
+    """
+    Render Health & Liveness probe. Runs fast SELECT 1 with no auth.
+    """
+    db_ok = True
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        db_ok = False
+
+    return {
+        "status": "healthy" if db_ok else "degraded",
+        "service": "repomentor-api",
+        "database": "connected" if db_ok else "disconnected"
+    }
+
+@router.get("/ready")
+def check_readiness(response: Response, db: Session = Depends(get_db)):
+    """
+    Readiness probe. Checks Postgres database connectivity and LLM configuration.
+    """
     postgres_ok = False
     groq_ok = False
 

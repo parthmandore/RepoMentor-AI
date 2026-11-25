@@ -1,3 +1,4 @@
+from sqlalchemy.orm.attributes import flag_modified
 import os
 import uuid
 import logging
@@ -13,7 +14,7 @@ from app.models.repository_file import RepositoryFile
 from app.models.security_issue import SecurityIssue
 from app.models.code_smell import CodeSmell
 from app.services.knowledge.evidence_builder import build_evidence_documents
-from app.services.knowledge.chunker import chunk_repository, select_best_chunks
+from app.services.knowledge.chunker import chunk_repository, select_best_chunks, should_skip_file
 from app.services.knowledge.embedder import verify_embeddings_status, generate_embeddings, EmbeddingGenerationError
 from app.repositories.vector_repository import VectorRepository
 
@@ -237,17 +238,23 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                 "file_path": doc["source_file"],
                 "language": "Text",
                 "module_type": "Unknown",
-                "chunk_type": "Evidence",
-                "start_line": 1,
-                "end_line": 1,
-                "content": chunk_content
+                "chunk_type": "evidence",
+                "start_line": None,
+                "end_line": None,
+                "content": chunk_content,
+                "priority_tier": 1,
+                "metadata": {"priority_tier": 1, "document_type": doc["document_type"]}
             })
             
         if evidence_chunks:
             log_info(f"[Knowledge] Embedding {len(evidence_chunks)} Evidence documents for progressive unlock...")
             ev_prompts = [c["content"] for c in evidence_chunks]
-            ev_embeddings = generate_embeddings(ev_prompts)
-            vector_repo.insert_embeddings(repo_id, evidence_chunks, ev_embeddings)
+            try:
+                ev_embeddings = generate_embeddings(ev_prompts)
+                vector_repo.insert_embeddings(repo_id, evidence_chunks, ev_embeddings)
+            except EmbeddingGenerationError as emb_err:
+                log_info(f"[Knowledge] Embedding provider unavailable ({emb_err}). Storing evidence chunks without vectors for keyword search.")
+                vector_repo.insert_embeddings(repo_id, evidence_chunks, [None] * len(evidence_chunks))
             
             # Mark indexing in-memory (no progressive unlock DB commit)
             repo.knowledge_status = "indexing"
@@ -271,12 +278,21 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
 
         embed_durations = []
         db_durations = []
+        t_emb_first = 0.0
+        t_emb_last = 0.0
         t_chunker_duration = 0.0
-        num_embedders = 2
+        num_embedders = 1
+        skipped_files = []
+        truncated_files = []
+        total_p1_target = 0
+        total_expected_chunks = len(evidence_chunks)
+        p1_embedded_count = 0
+        p1_unlocked = False
+        worker_errors = []
 
         # Thread 1: Chunker & Cache Checker
         def chunker_worker():
-            nonlocal file_cache_hits, file_cache_misses, chunks_generated, total_chunk_chars, max_chunk_char, t_chunker_duration
+            nonlocal file_cache_hits, file_cache_misses, chunks_generated, total_chunk_chars, max_chunk_char, t_chunker_duration, skipped_files, truncated_files, total_p1_target, total_expected_chunks
             t_c_start = time.perf_counter()
             try:
                 # Batched cache check: query all chunk metadata for this repository once
@@ -297,6 +313,7 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                     vector_repo.delete_files_vectors(repo_id, paths_to_delete)
                 
                 candidate_chunks = []
+                seen_content_hashes = set()
                 for f in db_files:
                     # In-memory file-level cache check
                     cached_chunks = all_cached_metadata.get(f.path, [])
@@ -304,52 +321,47 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                     # If cached chunks exist and their metadata's file_hash matches f.content_hash, cache hit!
                     if cached_chunks and cached_chunks[0].get("metadata", {}).get("file_hash") == f.content_hash:
                         continue
+
+                    # Option A: Deduplicate identical files across folders (e.g. frontend/ vs FrontendN/)
+                    if f.content_hash:
+                        if f.content_hash in seen_content_hashes:
+                            skipped_files.append({"path": f.path, "reason": "Option A: Duplicate file content", "size": f.size_bytes})
+                            continue
+                        seen_content_hashes.add(f.content_hash)
                         
                     if not f.is_text:
+                        skipped_files.append({"path": f.path, "reason": "Binary non-text file", "size": f.size_bytes})
                         continue
 
-                    # 1. Filter supported extensions for chunking
-                    supported_extensions = {
-                        ".java", ".py", ".js", ".jsx", ".ts", ".tsx",
-                        ".go", ".rs", ".cs", ".cpp", ".c", ".h", ".hpp",
-                        ".html", ".css"
-                    }
-                    if f.extension not in supported_extensions:
-                        continue
-
-                    # 2. Skip lock files, minified files, configs with no explanatory value
-                    fn_lower = os.path.basename(f.path).lower()
-                    if fn_lower in {
-                        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-                        "cargo.lock", "poetry.lock", "go.sum", "composer.lock",
-                        "pipfile.lock", "mix.lock"
-                    }:
-                        continue
-                        
-                    if ".min." in fn_lower or "-min." in fn_lower:
-                        continue
-
-                    # 3. Size-based thresholds for configs/docs
-                    if f.extension == ".json" and f.size_bytes > 50 * 1024:
-                        continue
-                    if f.extension == ".md" and f.size_bytes > 100 * 1024:
-                        continue
-                    if f.extension in (".yaml", ".yml") and f.size_bytes > 50 * 1024:
-                        continue
-                        
                     abs_path = os.path.join(clone_path, f.path)
-                    if not os.path.isfile(abs_path):
-                        continue
-                        
                     f_content = ""
                     if file_contents and f.path in file_contents:
                         f_content = file_contents[f.path]
-                    else:
+                    elif os.path.isfile(abs_path):
                         try:
                             with open(abs_path, "r", encoding="utf-8", errors="replace") as file_obj:
                                 f_content = file_obj.read()
                         except OSError:
                             continue
+
+                    # 1. General guard check: empty files, dotfiles, data dumps, minified, oversized
+                    should_skip, skip_reason = should_skip_file(f.path, f.extension, f.size_bytes, f_content)
+                    if should_skip:
+                        skipped_files.append({"path": f.path, "reason": skip_reason, "size": f.size_bytes})
+                        continue
+
+                    # 2. Supported file extensions for chunking
+                    supported_extensions = {
+                        ".java", ".py", ".js", ".jsx", ".ts", ".tsx",
+                        ".go", ".rs", ".cs", ".cpp", ".c", ".h", ".hpp",
+                        ".html", ".css", ".ipynb", ".md", ".json", ".txt", ".yaml", ".yml"
+                    }
+                    if f.extension and f.extension.lower() not in supported_extensions:
+                        skipped_files.append({"path": f.path, "reason": f"Non-code file format ({f.extension})", "size": f.size_bytes})
+                        continue
+
+                    if not f_content:
+                        continue
                         
                     # Generate adaptive chunks for this file
                     f_meta_list = [
@@ -364,30 +376,59 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                             "analysis_metadata": f.analysis_metadata
                         }
                     ]
-                    f_chunks = chunk_repository(f_meta_list, {f.path: f_content}, [], str(repo_id))
+                    f_chunks = chunk_repository(f_meta_list, {f.path: f_content}, [], str(repo_id), truncated_files=truncated_files)
                     candidate_chunks.extend(f_chunks)
                 
-                # Enforce dynamic global budget to hit the target 180-250 chunks.
-                # Evidence chunks are embedded in Batch 0 (len(evidence_chunks)).
-                # Target total chunks: 240. So target code chunks = 240 - len(evidence_chunks).
-                target_code_chunks = max(100, 240 - len(evidence_chunks))
+                from app.services.knowledge.chunker import is_priority_1_chunk
                 
-                selected_chunks = select_best_chunks(candidate_chunks, max_budget=target_code_chunks, sec_issues=sec_issues)
-                log_info(f"[Knowledge] Global budget enforcement: selected {len(selected_chunks)} chunks from {len(candidate_chunks)} candidates. Target was {target_code_chunks}.")
+                # Split candidate chunks into Priority 1 and Priority 2
+                p1_candidates = []
+                p2_candidates = []
+                for c in candidate_chunks:
+                    if "metadata" not in c or not isinstance(c["metadata"], dict):
+                        c["metadata"] = {}
+                    if is_priority_1_chunk(c):
+                        c["priority_tier"] = 1
+                        c["metadata"]["priority_tier"] = 1
+                        p1_candidates.append(c)
+                    else:
+                        c["priority_tier"] = 2
+                        c["metadata"]["priority_tier"] = 2
+                        p2_candidates.append(c)
+                        
+                p1_selected = p1_candidates
+                p2_selected = p2_candidates
                 
-                # Clear raw candidate chunks list immediately to release memory
-                candidate_chunks.clear()
-                del candidate_chunks
+                total_p1_target = len(p1_selected)
+                total_expected_chunks = len(evidence_chunks) + len(p1_selected) + len(p2_selected)
+                log_info(f"[Knowledge] Priority Partitioning: {len(p1_selected)} Priority 1 chunks, {len(p2_selected)} Priority 2 chunks (Total: {total_expected_chunks}).")
                 
-                # Add surviving chunks to queue
-                for chunk in selected_chunks:
+                # Add Priority 1 chunks to queue first
+                for chunk in p1_selected:
                     chunk_queue.put(chunk)
                     chunk_len = len(chunk["content"])
                     total_chunk_chars += chunk_len
                     max_chunk_char = max(max_chunk_char, chunk_len)
+
+                # Add Priority 2 chunks to queue next
+                for chunk in p2_selected:
+                    chunk_queue.put(chunk)
+                    chunk_len = len(chunk["content"])
+                    total_chunk_chars += chunk_len
+                    max_chunk_char = max(max_chunk_char, chunk_len)
+
+                candidate_chunks.clear()
+                p1_candidates.clear()
+                p2_candidates.clear()
+                p1_selected.clear()
+                p2_selected.clear()
                         
             except Exception as w_err:
+                worker_errors.append(("Chunking", str(w_err)))
                 logger.error(f"Chunker worker failed: {w_err}", exc_info=True)
+                print(f"[ERROR] Chunker worker failed: {w_err}", flush=True)
+                import traceback
+                traceback.print_exc()
             finally:
                 t_chunker_duration = time.perf_counter() - t_c_start
                 # Signal each embedder that chunking is finished
@@ -396,19 +437,31 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
 
         # Thread 2: Parallel Embedder
         def embedder_worker():
+            nonlocal t_emb_first, t_emb_last
             try:
                 batch = []
-                batch_size = 128  # Safe large batch size for local FastEmbed TextEmbedding
+                batch_size = 64  # Optimal measured batch size for FastEmbed on CPU
                 
                 while True:
                     chunk = chunk_queue.get()
                     if chunk is None:
+                        print(f"[DEBUG embedder] Received None. Batch length: {len(batch)}", flush=True)
                         # Process remaining in batch
                         if batch:
                             prompts = [c["content"] for c in batch]
                             t_emb_call_start = time.perf_counter()
-                            embeddings = generate_embeddings(prompts)
-                            embed_durations.append(time.perf_counter() - t_emb_call_start)
+                            if t_emb_first == 0.0:
+                                t_emb_first = t_emb_call_start
+                            try:
+                                embeddings = generate_embeddings(prompts)
+                            except EmbeddingGenerationError as emb_err:
+                                logger.info(f"[Knowledge] Embedding API unavailable ({emb_err}). Storing batch of {len(batch)} chunks without vectors for keyword search.")
+                                embeddings = [None] * len(batch)
+                            t_emb_call_end = time.perf_counter()
+                            t_emb_last = t_emb_call_end
+                            t_emb_call = t_emb_call_end - t_emb_call_start
+                            embed_durations.append(t_emb_call)
+                            print(f"[DEBUG embedder] Embedded {len(batch)} chunks in {t_emb_call:.2f}s. Putting to db_queue", flush=True)
                             db_queue.put((batch, embeddings))
                         break
                         
@@ -416,13 +469,27 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                     if len(batch) >= batch_size:
                         prompts = [c["content"] for c in batch]
                         t_emb_call_start = time.perf_counter()
-                        embeddings = generate_embeddings(prompts)
-                        embed_durations.append(time.perf_counter() - t_emb_call_start)
+                        if t_emb_first == 0.0:
+                            t_emb_first = t_emb_call_start
+                        try:
+                            embeddings = generate_embeddings(prompts)
+                        except EmbeddingGenerationError as emb_err:
+                            logger.info(f"[Knowledge] Embedding API unavailable ({emb_err}). Storing batch of {len(batch)} chunks without vectors for keyword search.")
+                            embeddings = [None] * len(batch)
+                        t_emb_call_end = time.perf_counter()
+                        t_emb_last = t_emb_call_end
+                        t_emb_call = t_emb_call_end - t_emb_call_start
+                        embed_durations.append(t_emb_call)
+                        print(f"[DEBUG embedder] Embedded full batch {len(batch)} chunks in {t_emb_call:.2f}s. Putting to db_queue", flush=True)
                         db_queue.put((batch, embeddings))
                         batch = []
                         
             except Exception as w_err:
+                worker_errors.append(("Embedding", str(w_err)))
                 logger.error(f"Embedder worker failed: {w_err}", exc_info=True)
+                print(f"[ERROR] Embedder worker failed: {w_err}", flush=True)
+                import traceback
+                traceback.print_exc()
             finally:
                 db_queue.put(None)  # Sentinel
 
@@ -454,24 +521,60 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         sentinels_received = 0
         
         while True:
-            # Watchdog timeout check
+            if worker_errors:
+                stage, err_msg = worker_errors[0]
+                failure_stage = stage
+                raise RuntimeError(f"{stage} worker crashed: {err_msg}")
+
+            # Watchdog timeout check - graceful partial indexing instead of crashing
             elapsed = time.time() - t_kb_loop_start
             if elapsed > timeout_seconds:
-                raise TimeoutError(f"Knowledge Base compilation exceeded maximum allowed duration of {timeout_seconds} seconds.")
+                logger.warning(f"Knowledge Base compilation reached {timeout_seconds}s limit. Finalizing {chunks_embedded} chunks gracefully.")
+                try:
+                    s_repo.knowledge_status = "ready" if p1_unlocked else "partial"
+                    s_repo.status_message = f"Chat index: {min(99, int((chunks_embedded / max(1, total_expected_chunks)) * 100))}% ({chunks_embedded} chunks indexed)"
+                    s_db.commit()
+                except Exception:
+                    pass
+                break
                 
             item = db_queue.get()
             if item is None:
                 sentinels_received += 1
+                print(f"[DEBUG db_loop] Received sentinel {sentinels_received}/{num_embedders}", flush=True)
                 if sentinels_received >= num_embedders:
                     break
                 continue
                 
             batch_chunks, batch_embeddings = item
             batch_size = len(batch_chunks)
+            print(f"[DEBUG db_loop] Got batch of {batch_size} chunks from db_queue. Inserting into pgvector...", flush=True)
             t_db_call_start = time.perf_counter()
             s_vector_repo.insert_embeddings(repo_id, batch_chunks, batch_embeddings)
             db_durations.append(time.perf_counter() - t_db_call_start)
             
+            for chunk in batch_chunks:
+                if chunk.get("priority_tier") == 1:
+                    p1_embedded_count += 1
+
+            if not p1_unlocked and (p1_embedded_count >= total_p1_target or total_p1_target == 0):
+                p1_unlocked = True
+                try:
+                    s_db.expire_all()
+                    s_db.refresh(s_repo)
+                    s_repo.knowledge_status = "ready"
+                    pct = int(((len(evidence_chunks) + p1_embedded_count) / max(1, total_expected_chunks)) * 100)
+                    pct = min(99, max(50, pct))
+                    s_repo.status_message = f"Chat index: {pct}%"
+                    summary_details = dict(s_repo.knowledge_summary or {})
+                    summary_details["chat_index_progress"] = pct
+                    s_repo.knowledge_summary = summary_details
+                    flag_modified(s_repo, "knowledge_summary")
+                    s_db.commit()
+                    log_info(f"[Knowledge] Priority 1 indexing ready ({p1_embedded_count} chunks). Mentor unblocked. Chat index: {pct}%")
+                except Exception as p1_err:
+                    logger.warning(f"Failed to commit P1 unlock state: {p1_err}")
+
             # Release batch memory immediately
             batch_chunks.clear()
             batch_embeddings.clear()
@@ -505,6 +608,11 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         t_chunker.join()
         for t_emb in embedder_threads:
             t_emb.join()
+        
+        if worker_errors:
+            stage, err_msg = worker_errors[0]
+            failure_stage = stage
+            raise RuntimeError(f"{stage} worker crashed: {err_msg}")
         
         t_chunking_caching_duration = time.perf_counter() - t_embed_start
         log_info(f"[Knowledge] END Chunking ({t_chunker_duration:.2f}s)")
@@ -551,6 +659,7 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         from app.services.analysis.scoring import calculate_weighted_health_score, calculate_grade
         
         # Aggregate details
+        db.refresh(repo)
         current_summary = repo.knowledge_summary or {}
         arch_knowledge = current_summary.get("architecture_knowledge") or {}
         timing_data = current_summary.get("timing_metadata") or {}
@@ -799,35 +908,68 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
             "recruiter_summary": recruiter_summary
         }
 
-        # Populate performance metrics (Task 10)
-        t_embeds = sum(embed_durations)
-        t_db = sum(db_durations)
-        t_kb_total = time.perf_counter() - t_kb_start
+        # Populate performance metrics with real wall-clock measurements
+        t_embed_wall = round(t_emb_last - t_emb_first, 3) if t_emb_last > t_emb_first else round(sum(embed_durations), 3)
+        t_db_wall = round(sum(db_durations), 3)
+        t_kb_total = round(time.perf_counter() - t_kb_start, 3)
+        t_phase_a_total = timing_data.get("total_phase_a", 0.0)
+        t_total_pipeline = round(t_phase_a_total + t_kb_total, 3)
         
+        stages_sum = round(
+            timing_data.get("clone", 0.0) +
+            timing_data.get("parsing", 0.0) +
+            timing_data.get("metrics", 0.0) +
+            timing_data.get("architecture", 0.0) +
+            timing_data.get("security", 0.0) +
+            t_chunker_duration +
+            t_embed_wall +
+            t_db_wall +
+            timing_data.get("assessment", 0.0),
+            3
+        )
+        other_unaccounted = max(0.0, round(t_total_pipeline - stages_sum, 3))
+
         performance_metrics = {
             "clone": timing_data.get("clone", 0.0),
             "parser": timing_data.get("parsing", 0.0),
+            "metrics": timing_data.get("metrics", 0.0),
             "architecture": timing_data.get("architecture", 0.0),
             "security": timing_data.get("security", 0.0),
-            "chunking": round(t_chunker_duration, 2),
-            "embeddings": round(t_embeds, 2),
-            "database": round(t_db, 2),
-            "knowledge": round(t_kb_total, 2),
-            "total": round(timing_data.get("total_phase_a", 0.0) + t_kb_total, 2)
+            "time_to_first_page": t_phase_a_total,
+            "chunking": round(t_chunker_duration, 3),
+            "embeddings": t_embed_wall,
+            "database": t_db_wall,
+            "vector_database": t_db_wall,
+            "assessment": timing_data.get("assessment", 0.0),
+            "other_unaccounted": other_unaccounted,
+            "knowledge": t_kb_total,
+            "total": t_total_pipeline,
+            "skipped_files": skipped_files,
+            "skipped_files_count": len(skipped_files),
+            "truncated_files": truncated_files,
+            "truncated_files_count": len(truncated_files)
         }
 
         # Combine everything into final knowledge_summary JSON
         summary_data = {
             "total_chunks": chunks_generated,
-            "code_chunks": chunks_generated - len(evidence_chunks),
+            "code_chunks": max(0, chunks_generated - len(evidence_chunks)),
             "evidence_documents": len(evidence_chunks),
+            "expected_chunk_count": total_expected_chunks,
+            "stored_chunk_count": chunks_generated,
+            "embedding_model": getattr(settings, "EMBEDDING_MODEL", "text-embedding-004"),
+            "embedding_dim": getattr(settings, "EMBEDDING_DIMENSION", 768),
             "indexed_files": len(indexed_files),
             "supported_languages": supported_langs,
             "build_status": "completed",
             "last_commit_hash": local_hash,
             "file_cache_hits": file_cache_hits,
             "file_cache_misses": file_cache_misses,
-            "embedding_status": "Local BAAI/bge-small-en-v1.5 active",
+            "skipped_files": skipped_files,
+            "truncated_files": truncated_files,
+            "embedding_provider": f"External API ({getattr(settings, 'EMBEDDING_MODEL', 'text-embedding-004')})",
+            "embedding_status": f"External {getattr(settings, 'EMBEDDING_MODEL', 'text-embedding-004')} active",
+            "chat_index_progress": 100,
             "evidence_docs_list": [
                 {
                     "document_type": d["document_type"],
@@ -850,7 +992,8 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         }
 
         repo.knowledge_status = "completed"
-        repo.knowledge_summary = summary_data
+        repo.knowledge_summary = dict(summary_data)
+        flag_modified(repo, "knowledge_summary")
         repo.status_message = None
         db.commit()
         
@@ -876,15 +1019,17 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
                 if "timed out" in str(e).lower() or isinstance(e, TimeoutError):
                     repo.status_message = "Knowledge build timed out"
                 else:
-                    repo.status_message = "Failed: Cloud Embeddings error"
-                repo.error_message = f"Knowledge base compilation error: {str(e)}"
+                    repo.status_message = f"Failed: {failure_stage}"
+                repo.error_message = f"Knowledge base compilation error in stage '{failure_stage}': {str(e)}"
                 
-                # Update knowledge_summary with failed metadata and knowledge_error
-                summary = repo.knowledge_summary or {}
+                # Update knowledge_summary with failed metadata and failure details
+                summary = dict(repo.knowledge_summary or {})
                 summary["knowledge_error"] = str(e)
                 summary["build_status"] = "failed"
+                summary["failure_stage"] = failure_stage
+                summary["failure_reason"] = failure_reason
                 repo.knowledge_summary = summary
-                
+                flag_modified(repo, "knowledge_summary")
                 db.commit()
         except Exception as db_err:
             logger.critical(f"Failed to update failed knowledge status: {db_err}")

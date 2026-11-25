@@ -238,24 +238,44 @@ repository-mentor-ai/
 
 ## 🌐 Production Deployment
 
-### Backend Deployment (Render)
-1. Create a new **Web Service** on Render pointing to your Git repository.
-2. Select **Docker** as the Runtime environment (Free Instance).
-3. Set the following path variables in advanced settings:
-   * **Dockerfile Path**: `backend/Dockerfile`
-   * **Build Context**: `backend`
-4. Set environment variables (`DATABASE_URL` for managed PostgreSQL with pgvector, `GROQ_API_KEY`, `ENABLE_KNOWLEDGE_BASE=true`).
-
-### Frontend Deployment (Netlify)
-1. Link your Git repository on Netlify.
-2. Configure build configurations:
-   * **Base Directory**: `frontend`
+### 1. Frontend Deployment (Vercel)
+1. Import your GitHub repository into [Vercel](https://vercel.com).
+2. Configure project settings:
+   * **Framework Preset**: Next.js
+   * **Root Directory**: `frontend`
    * **Build Command**: `npm run build`
-   * **Publish Directory**: `frontend/.next`
-3. Add the Environment Variable `NEXT_PUBLIC_API_URL` pointing to your Render backend API URL (e.g. `https://repomentor-ai.onrender.com/api/v1`).
+   * **Output Directory**: `.next`
+3. Add Environment Variables:
+   * `NEXT_PUBLIC_API_URL`: Your Render backend API URL (e.g. `https://repomentor-ai.onrender.com/api/v1`).
+4. Click **Deploy**. Vercel automatically deploys edge-cached global routing with sub-second page loads.
 
-> [!TIP]
-> *For detailed, step-by-step production guidelines, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).*
+### 2. Backend Deployment (Render Free Tier)
+1. Create a new **Web Service** on [Render](https://render.com).
+2. Select your repository and configure:
+   * **Region**: **Singapore** (recommended: lowest WAN RTT to Supabase `ap-south-1` Mumbai).
+   * **Runtime**: Python 3.11 / Docker (Root: `backend`, Dockerfile: `backend/Dockerfile`).
+   * **Instance Type**: **Free** (512 MB RAM, ~0.1 vCPU).
+   * **Build Command**: `pip install -r requirements.txt`
+   * **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+3. Configure Environment Variables:
+   * `DATABASE_URL`: Managed Supabase PostgreSQL URL with `postgresql://...` pooler connection string.
+   * `GROQ_API_KEY`: Groq API Cloud key for sub-second LLM streaming.
+   * `EMBEDDING_PROVIDER`: `gemini` (or `openai` for OpenAI-compatible providers).
+   * `GEMINI_API_KEY`: Google Gemini API key (`gemini-embedding-001`).
+   * `CORS_ORIGINS`: `["https://your-app.vercel.app", "http://localhost:3000"]`
+4. Set **Health Check Path** to: `/api/v1/health`.
+
+### 3. Preventing Cold Starts (External Pinger Setup)
+> [!IMPORTANT]
+> Render Free instances sleep after 15 minutes of inactivity, causing a 50+ second container boot delay.
+>
+> 1. Set up a free external uptime monitor (e.g. [UptimeRobot](https://uptimerobot.com), [cron-job.org](https://cron-job.org), or BetterUptime).
+> 2. Configure an **HTTP GET** monitor targeting:
+>    ```
+>    https://repomentor-ai.onrender.com/api/v1/health
+>    ```
+> 3. Set the polling interval to **every 10 minutes**.
+> 4. The `/api/v1/health` endpoint executes an unauthenticated `SELECT 1` query that verifies and keeps both the Render container and the Supabase database connection pool warm 24/7 with zero cold starts at $0.00 cost.
 
 ---
 

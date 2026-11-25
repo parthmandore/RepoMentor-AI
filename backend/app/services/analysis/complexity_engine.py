@@ -77,17 +77,26 @@ class ComplexityEngine:
             "max_complexity": max_complexity
         }
 
+    BRANCH_INDICATORS = ("if", "for", "while", "catch", "case", "&&", "||", "?", "switch", "throw", "raise")
+
     @classmethod
     def calculate_brace_complexity(cls, content: str, declarations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Calculates complexity using regex pattern matching for brace-based languages."""
-        lines = content.split("\n")
-        functions = []
-        
         # Filter declarations to functions/methods/constructors
         func_declarations = [
             d for d in declarations 
             if d.get("type") in ("function", "method", "constructor")
         ]
+        if not func_declarations:
+            return {
+                "file_complexity": 1,
+                "functions": [],
+                "average_complexity": 1.0,
+                "max_complexity": 1
+            }
+
+        lines = content.split("\n")
+        functions = []
 
         for func in func_declarations:
             start_line = func.get("line", 1)
@@ -101,39 +110,44 @@ class ComplexityEngine:
             exceptions = 0
             branches = 0
             switches = 0
-
-            # Count branch points
             branch_points = 0
-            for name, pattern in cls.BRACE_PATTERNS.items():
-                matches = len(pattern.findall(func_text))
-                if name in ("if", "else_if"):
-                    branches += matches
-                    decisions += matches
-                elif name in ("for", "while"):
-                    loops += matches
-                    decisions += matches
-                elif name == "catch":
-                    exceptions += matches
-                    decisions += matches
-                elif name == "case":
-                    branch_points += matches
-                elif name in ("logical_and", "logical_or", "ternary"):
-                    decisions += matches
-                elif name == "switch":
-                    switches += matches
+
+            # Fast path: check if any branch indicators exist before running 11 regex findall sweeps
+            if any(kw in func_text for kw in cls.BRANCH_INDICATORS):
+                for name, pattern in cls.BRACE_PATTERNS.items():
+                    matches = len(pattern.findall(func_text))
+                    if not matches:
+                        continue
+                    if name in ("if", "else_if"):
+                        branches += matches
+                        decisions += matches
+                    elif name in ("for", "while"):
+                        loops += matches
+                        decisions += matches
+                    elif name == "catch":
+                        exceptions += matches
+                        decisions += matches
+                    elif name == "case":
+                        branch_points += matches
+                    elif name in ("logical_and", "logical_or", "ternary"):
+                        decisions += matches
+                    elif name == "switch":
+                        switches += matches
 
             complexity = 1 + decisions + branch_points
 
-            # Maximum Nesting calculation using braces count
+            # Fast Maximum Nesting calculation using C-level count
             nesting = 0
             current_nesting = 0
             for line in func_lines:
-                for char in line:
-                    if char == "{":
-                        current_nesting += 1
-                        nesting = max(nesting, current_nesting)
-                    elif char == "}":
-                        current_nesting = max(0, current_nesting - 1)
+                opens = line.count("{")
+                closes = line.count("}")
+                if opens:
+                    current_nesting += opens
+                    if current_nesting > nesting:
+                        nesting = current_nesting
+                if closes:
+                    current_nesting = max(0, current_nesting - closes)
 
             functions.append({
                 "name": func.get("name", "anonymous"),

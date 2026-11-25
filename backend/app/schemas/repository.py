@@ -11,6 +11,8 @@ class RepositoryCreate(BaseModel):
 class RepositorySubmitResponse(BaseModel):
     id: uuid.UUID
     status: str
+    is_existing: Optional[bool] = False
+    queue_position: Optional[int] = None
 
 
 class RepositoryResponse(BaseModel):
@@ -18,6 +20,7 @@ class RepositoryResponse(BaseModel):
     url: str
     status: str
     status_message: Optional[str] = None
+    queue_position: Optional[int] = None
 
     # Discovery Statistics (Phase 2)
     total_files: int
