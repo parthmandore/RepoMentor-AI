@@ -82,7 +82,14 @@ def submit_repository(
             detail="Invalid GitHub repository URL. Must be a valid public GitHub link (e.g. https://github.com/owner/repo)."
         )
 
-    repo = db.query(Repository).filter(Repository.url == url).first()
+    try:
+        repo = db.query(Repository).filter(Repository.url == url).first()
+    except Exception as db_err:
+        logger.error(f"Database query error in submit_repository: {db_err}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database service is currently unavailable. Please verify backend database connectivity."
+        )
     if repo:
         # If repo is already READY and analyzed, return it directly without wiping data
         if repo.status == RepositoryStatus.READY and (repo.files_analyzed or 0) > 0:
@@ -1277,6 +1284,7 @@ def retry_knowledge_base(id: uuid.UUID, background_tasks: BackgroundTasks, db: S
         # Reset knowledge indexing states
         repo.knowledge_status = "pending"
         repo.status_message = "Re-indexing Knowledge Base..."
+        repo.error_message = None
         
         # Reset knowledge_summary metadata if exists
         summary = dict(repo.knowledge_summary or {})

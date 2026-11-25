@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.endpoints.health import router as health_router
@@ -78,13 +79,35 @@ app = FastAPI(
 )
 
 # Set CORS enabled origins
-if settings.CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[str(origin) for origin in settings.CORS_ORIGINS],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+cors_origins = [str(o).rstrip("/") for o in settings.CORS_ORIGINS] if settings.CORS_ORIGINS else []
+for origin in ["https://repomentor.netlify.app", "http://localhost:3000", "http://localhost:3010", "http://127.0.0.1:3000", "http://127.0.0.1:3010"]:
+    if origin not in cors_origins:
+        cors_origins.append(origin)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import logging, traceback
+    logging.getLogger("app.main").error(f"Global unhandled exception on {request.method} {request.url}: {exc}\n{traceback.format_exc()}")
+    origin = request.headers.get("origin")
+    resp_headers = {}
+    if origin and any(origin == o or o == "*" for o in cors_origins):
+        resp_headers["Access-Control-Allow-Origin"] = origin
+        resp_headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        resp_headers["Access-Control-Allow-Origin"] = "https://repomentor.netlify.app"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+        headers=resp_headers
     )
 
 # Include API routers under the API version prefix and convenience roots

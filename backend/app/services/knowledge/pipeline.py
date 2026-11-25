@@ -995,6 +995,7 @@ def build_knowledge_base(repo_id: uuid.UUID, clone_path: str, file_contents: dic
         repo.knowledge_summary = dict(summary_data)
         flag_modified(repo, "knowledge_summary")
         repo.status_message = None
+        repo.error_message = None
         db.commit()
         
         t_stage_duration = time.perf_counter() - t_stage_start
