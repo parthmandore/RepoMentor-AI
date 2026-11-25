@@ -1,10 +1,14 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { PageLayoutSkeleton } from '../../components/Skeletons';
+import Breadcrumbs from '../../components/Breadcrumbs';
+import { trackDiagnosticsExecuted } from '../../lib/analytics';
 import {
   ArrowLeft, RefreshCw, Cpu, Database, HardDrive, ShieldAlert,
-  CheckCircle2, AlertTriangle, Play, Loader2, Server, GitBranch, ListTodo, Activity
+  CheckCircle2, AlertTriangle, Play, Loader2, Server, GitBranch, ListTodo, Activity, Github
 } from 'lucide-react';
 
 interface DiagnosticInfo {
@@ -38,7 +42,7 @@ interface DiagnosticInfo {
 
 export default function DiagnosticsPage() {
   const router = useRouter();
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080/api/v1';
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 
   const [diagnostics, setDiagnostics] = useState<DiagnosticInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -52,6 +56,7 @@ export default function DiagnosticsPage() {
       if (!res.ok) throw new Error('Failed to fetch diagnostics.');
       const data = await res.json();
       setDiagnostics(data);
+      trackDiagnosticsExecuted(data.status === 'ok');
       setError(null);
     } catch (err: any) {
       setError(err.message || 'Diagnostics service offline');
@@ -66,17 +71,6 @@ export default function DiagnosticsPage() {
     const interval = setInterval(fetchDiagnostics, 10000); // refresh every 10s
     return () => clearInterval(interval);
   }, []);
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-darkbg-950 text-gray-100 font-sans">
-        <div className="text-center space-y-4">
-          <Loader2 className="w-8 h-8 animate-spin text-brand-500 mx-auto" />
-          <p className="text-sm text-gray-400">Querying platform status...</p>
-        </div>
-      </div>
-    );
-  }
 
   const getStatusBadge = (status: string) => {
     if (status === 'online' || status === 'available' || status === 'healthy') {
@@ -95,12 +89,29 @@ export default function DiagnosticsPage() {
 
   return (
     <div className="min-h-screen bg-darkbg-950 text-gray-100 flex flex-col font-sans">
-      <div className="max-w-5xl w-full mx-auto px-4 py-8 space-y-8 flex-grow">
+      <div className="max-w-5xl w-full mx-auto px-4 py-8 space-y-6 flex-grow">
         
-        {/* Header */}
-        <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 border-b border-gray-900 pb-6">
+        {/* Breadcrumbs Navigation */}
+        <Breadcrumbs
+          items={[
+            { label: 'Home', href: '/' },
+            { label: 'System Diagnostics', current: true },
+          ]}
+        />
+
+        {isLoading ? (
+          <PageLayoutSkeleton />
+        ) : (
+          <>
+            {/* Header */}
+            <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 border-b border-gray-900 pb-6">
           <div className="flex items-center gap-3">
-            <button onClick={() => router.push('/')} className="p-2 bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-xl text-gray-400 hover:text-white transition-all" title="Back to home">
+            <button 
+              onClick={() => router.push('/')} 
+              className="p-2 bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-xl text-gray-400 hover:text-white transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500" 
+              title="Back to home"
+              aria-label="Back to home"
+            >
               <ArrowLeft className="w-4 h-4" />
             </button>
             <div>
@@ -113,7 +124,8 @@ export default function DiagnosticsPage() {
           <button
             disabled={isRefreshing}
             onClick={fetchDiagnostics}
-            className="px-4 py-2 bg-gray-900 border border-gray-800 hover:border-gray-700 text-xs font-semibold rounded-xl flex items-center gap-2 hover:text-white transition-all disabled:opacity-50"
+            aria-label="Refresh Status"
+            className="px-4 py-2 bg-gray-900 border border-gray-800 hover:border-gray-700 text-xs font-semibold rounded-xl flex items-center gap-2 hover:text-white transition-all disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-brand-400' : 'text-gray-405'}`} />
             Refresh Status
@@ -264,11 +276,33 @@ export default function DiagnosticsPage() {
 
           </div>
         )}
+          </>
+        )}
 
       </div>
       
-      <footer className="w-full text-center py-6 text-xs text-slate-500 dark:text-zinc-500 border-t border-slate-200 dark:border-zinc-900/40 mt-8 font-mono">
-        Repository Mentor AI &copy; {new Date().getFullYear()}
+      <footer className="w-full text-center py-8 text-[11px] text-slate-500 dark:text-zinc-500 mt-12 border-t border-slate-200 dark:border-zinc-900/40 bg-slate-100/50 dark:bg-[#020308]/40 backdrop-blur-sm">
+        <div className="max-w-5xl mx-auto px-6 flex flex-col sm:flex-row justify-between items-center gap-4">
+          <p>Repository Mentor AI &copy; {new Date().getFullYear()}</p>
+          <div className="flex items-center gap-4">
+            <Link 
+              href="/" 
+              className="text-slate-500 hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400 font-medium transition-all duration-200"
+            >
+              Repository Dashboard
+            </Link>
+            <span className="text-slate-300 dark:text-zinc-800">|</span>
+            <a 
+              href="https://github.com/parthmandore/RepoMentor-AI" 
+              target="_blank" 
+              rel="noreferrer"
+              aria-label="View source code on GitHub"
+              className="text-slate-500 hover:text-slate-800 dark:text-zinc-400 dark:hover:text-white flex items-center gap-1 transition-all duration-200"
+            >
+              <Github className="w-3.5 h-3.5" /> Source Code
+            </a>
+          </div>
+        </div>
       </footer>
     </div>
   );

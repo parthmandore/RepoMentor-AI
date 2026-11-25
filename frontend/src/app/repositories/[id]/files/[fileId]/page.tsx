@@ -3,6 +3,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Header from '../../../../Header';
 import { useTheme } from '../../../../ThemeProvider';
+import { PageLayoutSkeleton } from '../../../../components/Skeletons';
+import EmptyState from '../../../../components/EmptyState';
+import Breadcrumbs from '../../../../components/Breadcrumbs';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   ArrowLeft, Code, BarChart3, Bug, FileText, Loader2, ShieldAlert,
@@ -209,7 +212,7 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
   const router = useRouter();
   const searchParams = useSearchParams();
   const { id: repoId, fileId } = params;
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080/api/v1';
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 
   const [repo, setRepo] = useState<any>(null);
   const [file, setFile] = useState<FileDetail | null>(null);
@@ -325,36 +328,46 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
     const comments = /(\/\/.*$|#.*$|\/\*[\s\S]*?\*\/)/gm;
 
     let highlighted = escaped
-      .replace(comments, '<span class="text-zinc-550 italic">$1</span>')
-      .replace(strings, '<span class="text-emerald-350">$&</span>')
-      .replace(keywords, '<span class="text-violet-400 font-semibold">$1</span>');
+      .replace(comments, '<span class="text-textMuted italic">$1</span>')
+      .replace(strings, '<span class="text-good">$&</span>')
+      .replace(keywords, '<span class="text-signal font-semibold">$1</span>');
 
     return highlighted;
   };
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bgPrimary text-textPrimary font-sans">
-        <div className="text-center space-y-6 max-w-sm w-full px-4">
-          <Loader2 className="w-10 h-10 animate-spin text-brand-500 mx-auto" />
-          <div className="space-y-2 animate-pulse">
-            <div className="h-4 bg-slate-200 dark:bg-zinc-800 rounded w-3/4 mx-auto" />
-            <div className="h-3 bg-slate-300 dark:bg-zinc-900 rounded w-1/2 mx-auto" />
-          </div>
-        </div>
+      <div className="min-h-screen bg-bgPrimary text-textPrimary flex flex-col font-sans relative overflow-hidden">
+        <Header repoId={repoId} repoUrl={repo?.url || ''} repoStatus={repo?.status || ''} activeTab="overview" />
+        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          <PageLayoutSkeleton />
+        </main>
       </div>
     );
   }
 
   if (error || !file) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bgPrimary px-4 font-sans text-textPrimary">
-        <div className="max-w-md w-full bg-bgSecondary border border-borderPrimary p-6 rounded-2xl shadow-sm text-center space-y-4">
-          <ShieldAlert className="w-8 h-8 text-rose-500 mx-auto animate-pulse" />
-          <h2 className="text-xl font-bold text-textPrimary">File Not Found</h2>
-          <p className="text-sm text-textSecondary leading-relaxed">{error}</p>
-          <button onClick={() => router.back()} className="w-full py-2.5 px-4 bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 border border-borderPrimary text-textPrimary rounded-xl text-sm font-semibold transition-all">Go Back</button>
-        </div>
+      <div className="min-h-screen bg-bgPrimary text-textPrimary flex flex-col font-sans relative overflow-hidden">
+        <Header repoId={repoId} repoUrl={repo?.url || ''} repoStatus={repo?.status || ''} activeTab="overview" />
+        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 flex items-center justify-center">
+          <div className="w-full max-w-xl">
+            <EmptyState
+              icon={ShieldAlert}
+              title="File Metrics Not Found"
+              description={error || "The requested file could not be located in this repository's analyzed index."}
+              variant="warning"
+              primaryAction={{
+                label: 'Return to Assessment',
+                href: `/repositories/${repoId}/assessment`,
+              }}
+              secondaryAction={{
+                label: 'Return to Overview',
+                href: `/repositories/${repoId}`,
+              }}
+            />
+          </div>
+        </main>
       </div>
     );
   }
@@ -377,6 +390,16 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
       {/* Main Workspace */}
       <main className="w-full max-w-[1700px] mx-auto px-4 sm:px-6 lg:px-12 pt-[92px] pb-6 space-y-6 flex-grow">
         
+        {/* Breadcrumb Navigation */}
+        <Breadcrumbs
+          items={[
+            { label: 'Dashboard', href: '/' },
+            { label: 'Repository', href: `/repositories/${repoId}` },
+            { label: 'File Explorer', href: `/repositories/${repoId}` },
+            { label: file.path, current: true },
+          ]}
+        />
+
         {/* TOP FILE METRICS */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
           <div className="bg-bgSecondary border border-borderPrimary p-4 rounded-2xl space-y-1 shadow-sm">
@@ -420,7 +443,8 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
               <span className="text-xs font-bold text-textPrimary flex items-center gap-1.5 font-mono"><Eye className="w-4 h-4 text-brand-500 dark:text-brand-400" /> Source Inspector</span>
               <button 
                 onClick={() => setIsCodeCollapsed(!isCodeCollapsed)} 
-                className="text-[10px] text-textSecondary hover:text-textPrimary uppercase font-bold tracking-wider transition-colors"
+                aria-label={isCodeCollapsed ? 'Expand View' : 'Collapse View'}
+                className="text-[10px] text-textSecondary hover:text-textPrimary uppercase font-bold tracking-wider transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500"
               >
                 {isCodeCollapsed ? 'Expand View' : 'Collapse View'}
               </button>
@@ -428,47 +452,58 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
 
             {!isCodeCollapsed && (
               <div className="border border-borderPrimary bg-bgSecondary rounded-b-2xl overflow-hidden shadow-sm">
-                <div className="flex font-mono text-[11px] leading-relaxed max-h-[600px] overflow-y-auto">
-                  
-                  {/* Line numbers gutter */}
-                  <div className="text-right pr-3 pl-4 py-4 bg-slate-50 dark:bg-zinc-950/50 text-slate-400 dark:text-zinc-650 border-r border-slate-200 dark:border-zinc-900 select-none">
-                    {codeContent.split('\n').map((_, idx) => {
-                      const lineNum = idx + 1;
-                      const hasSmell = file.smells.some(s => s.line_number === lineNum);
-                      return (
-                        <div 
-                          key={idx} 
-                          className={`cursor-pointer hover:text-textPrimary flex items-center justify-end gap-1 ${
-                            highlightedLine === lineNum ? 'text-yellow-600 dark:text-yellow-400 font-bold' : ''
-                          }`}
-                          onClick={() => handleLineClick(lineNum)}
-                        >
-                          {hasSmell && <span className="w-1.5 h-1.5 rounded-full bg-rose-500 inline-block animate-pulse" title="Code Smell here" />}
-                          {lineNum}
-                        </div>
-                      );
-                    })}
-                  </div>
-                  
-                  {/* Executable Code block */}
-                  <div className="flex-grow space-y-0.5 select-text overflow-x-auto py-4 pl-4 pr-4 bg-slate-50/30 dark:bg-[#0a0d18]/40">
-                    {codeContent.split('\n').map((line, idx) => {
-                      const lineNum = idx + 1;
-                      const isHighlighted = highlightedLine === lineNum;
-                      return (
-                        <div 
-                          key={idx} 
-                          ref={el => { lineRefs.current[lineNum] = el; }} 
-                          className={`px-2 transition-all duration-300 rounded ${
-                            isHighlighted ? 'bg-yellow-500/10 border-l-2 border-yellow-500 text-textPrimary font-medium' : 'hover:bg-slate-100/50 dark:hover:bg-zinc-900/30'
-                          }`}
-                          dangerouslySetInnerHTML={{ __html: highlightCodeLine(line, file.extension || '') }} 
-                        />
-                      );
-                    })}
-                  </div>
+                {codeContent ? (
+                  <div className="flex font-mono text-[11px] leading-relaxed max-h-[600px] overflow-y-auto">
+                    
+                    {/* Line numbers gutter */}
+                    <div className="text-right pr-3 pl-4 py-4 bg-slate-50 dark:bg-zinc-950/50 text-slate-400 dark:text-zinc-650 border-r border-slate-200 dark:border-zinc-900 select-none">
+                      {codeContent.split('\n').map((_, idx) => {
+                        const lineNum = idx + 1;
+                        const hasSmell = file.smells.some(s => s.line_number === lineNum);
+                        return (
+                          <div 
+                            key={idx} 
+                            className={`cursor-pointer hover:text-textPrimary flex items-center justify-end gap-1 ${
+                              highlightedLine === lineNum ? 'text-yellow-600 dark:text-yellow-400 font-bold' : ''
+                            }`}
+                            onClick={() => handleLineClick(lineNum)}
+                          >
+                            {hasSmell && <span className="w-1.5 h-1.5 rounded-full bg-rose-500 inline-block animate-pulse" title="Code Smell here" />}
+                            {lineNum}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    
+                    {/* Executable Code block */}
+                    <div className="flex-grow space-y-0.5 select-text overflow-x-auto py-4 pl-4 pr-4 bg-slate-50/30 dark:bg-[#0a0d18]/40">
+                      {codeContent.split('\n').map((line, idx) => {
+                        const lineNum = idx + 1;
+                        const isHighlighted = highlightedLine === lineNum;
+                        return (
+                          <div 
+                            key={idx} 
+                            ref={el => { lineRefs.current[lineNum] = el; }} 
+                            className={`px-2 transition-all duration-300 rounded ${
+                              isHighlighted ? 'bg-yellow-500/10 border-l-2 border-yellow-500 text-textPrimary font-medium' : 'hover:bg-slate-100/50 dark:hover:bg-zinc-900/30'
+                            }`}
+                            dangerouslySetInnerHTML={{ __html: highlightCodeLine(line, file.extension || '') }} 
+                          />
+                        );
+                      })}
+                    </div>
 
-                </div>
+                  </div>
+                ) : (
+                  <div className="p-8">
+                    <EmptyState
+                      icon={FileText}
+                      title={file.is_text ? 'No Content Available' : 'Binary File'}
+                      description={file.is_text ? 'This source file is empty or its content could not be retrieved from the server.' : 'This file is marked as binary and cannot be displayed in the text inspector.'}
+                      variant="neutral"
+                    />
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -585,7 +620,11 @@ export default function FileDetailPage({ params }: { params: { id: string; fileI
             <h2 className="text-sm font-extrabold text-textPrimary flex items-center gap-1.5 font-mono">
               <HelpCircle className="w-5 h-5 text-indigo-500 dark:text-indigo-400" /> Learn: {LEARNING_DATA[activeLearningConcept].title}
             </h2>
-            <button onClick={() => setActiveLearningConcept(null)} className="p-1.5 text-textSecondary hover:text-textPrimary rounded-lg border border-borderPrimary hover:border-slate-300 dark:hover:border-zinc-700 transition-colors">
+            <button 
+              onClick={() => setActiveLearningConcept(null)} 
+              aria-label="Close learning concept panel"
+              className="p-1.5 text-textSecondary hover:text-textPrimary rounded-lg border border-borderPrimary hover:border-slate-300 dark:hover:border-zinc-700 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-brand-500"
+            >
               <X className="w-4 h-4" />
             </button>
           </div>

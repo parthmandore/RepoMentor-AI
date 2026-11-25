@@ -1,21 +1,18 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
-  ArrowLeft, Sparkles, Send, Loader2, Cpu, AlertTriangle, CheckCircle,
-  FileText, Shield, Compass, BookOpen, Clock, BarChart3, ChevronRight,
-  User, Play, Sliders, Layers, RefreshCw, X, ChevronLeft, ArrowRightLeft,
-  Bug, Zap, HelpCircle, Code, Info, Gauge
+  Sparkles, Send, Loader2, User, ChevronRight, X,
+  FileCode, Terminal, HelpCircle, ArrowUpRight, Check,
+  BookOpen, Shield, Flame, AlertCircle, RotateCw, Square, ShieldAlert
 } from 'lucide-react';
 
 import Header from '../../../Header';
-
-interface ChatSessionResponse {
-  session_id: string;
-  repository_id: string;
-  created_at: string;
-}
+import MarkdownRenderer from '../../../components/MarkdownRenderer';
+import { PageLayoutSkeleton } from '../../../components/Skeletons';
+import { trackMentorQuerySent } from '../../../lib/analytics';
+import { useToast } from '../../../ToastProvider';
 
 interface Citation {
   similarity_score: number;
@@ -35,156 +32,79 @@ interface Message {
   confidence?: number;
   expert_mode?: string;
   created_at: string;
+  is_error?: boolean;
+  model_used?: string;
+  code_index_incomplete?: boolean;
 }
 
-interface Lesson {
-  slide_index: number;
-  title: string;
-  content: string;
+interface ActiveError {
+  code?: number;
+  message: string;
+  retryable: boolean;
+  retryAfter?: number;
+  submittedText: string;
 }
 
-interface FileOption {
-  id: string;
-  path: string;
-}
-
-// Lightweight syntax highlighting engine
-function highlightCode(code: string = '') {
-  if (!code) return '';
-  let escaped = code
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-
-  const keywords = /\b(class|struct|interface|enum|def|func|function|fn|return|if|else|for|while|import|package|public|private|protected|static|final|abstract|const|let|var|try|catch|throw|raise|use|namespace)\b/g;
-  const strings = /(["'`])(.*?)\1/g;
-  const comments = /(\/\/.*$|#.*$|\/\*[\s\S]*?\*\/)/gm;
-
-  escaped = escaped.replace(comments, '<span class="text-gray-500 italic">$1</span>');
-  escaped = escaped.replace(strings, '<span class="text-emerald-300">$&</span>');
-  escaped = escaped.replace(keywords, '<span class="text-pink-400 font-bold">$1</span>');
-  
-  return escaped;
-}
-
-export default function RepositoryExpert({ params }: { params: { id: string } }) {
+export default function RepositoryMentorPage({ params }: { params: { id: string } }) {
   const router = useRouter();
+  const toast = useToast();
   const repoId = params.id;
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080/api/v1';
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
 
-  // Persistence State
   const searchParams = useSearchParams();
   const queryQ = searchParams?.get('q') || '';
 
+  const [repo, setRepo] = useState<any>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
-  const [expertMode, setExpertMode] = useState('General');
-  const [explainMode, setExplainMode] = useState('Senior Engineer');
-  const [flashLine, setFlashLine] = useState<number | null>(null);
-  const [expertModes, setExpertModes] = useState<Array<{ mode: string; description: string }>>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [isSending, setIsSending] = useState(false);
+  const [isReindexing, setIsReindexing] = useState(false);
+  const [streamStage, setStreamStage] = useState<'idle' | 'searching' | 'writing' | 'streaming' | 'error'>('idle');
+  const [activeError, setActiveError] = useState<ActiveError | null>(null);
+  const [streamingResponse, setStreamingResponse] = useState('');
+  const [streamingCitations, setStreamingCitations] = useState<Citation[]>([]);
   const [starterQuestions, setStarterQuestions] = useState<string[]>([]);
+
+  // Citation Modal Overlay State
+  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const lastSubmittedTextRef = useRef<string>('');
 
   useEffect(() => {
     if (queryQ) {
       setInputText(queryQ);
     }
   }, [queryQ]);
-  
-  // Status States
-  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
-  const [isSending, setIsSending] = useState(false);
-  const [streamingResponse, setStreamingResponse] = useState('');
-  const [streamingCitations, setStreamingCitations] = useState<Citation[]>([]);
-  const [streamingConfidence, setStreamingConfidence] = useState<number | null>(null);
-  const [streamingSteps, setStreamingSteps] = useState<string[]>([]);
-  const [streamingFollowUp, setStreamingFollowUp] = useState<string[]>([]);
-  
-  // Walkthrough Lesson States
-  const [isWalkthroughOpen, setIsWalkthroughOpen] = useState(false);
-  const [lessons, setLessons] = useState<Lesson[]>([]);
-  const [activeLessonIdx, setActiveLessonIdx] = useState(0);
 
-  // Citation Modal Overlay State
-  const [citationModal, setCitationModal] = useState<{
-    isOpen: boolean;
-    filePath: string;
-    lineNumbers: string;
-    content: string;
-  }>({ isOpen: false, filePath: '', lineNumbers: '', content: '' });
-
-  // File Inspector States
-  const [filesList, setFilesList] = useState<FileOption[]>([]);
-  const [selectedFileId, setSelectedFileId] = useState<string>('');
-  const [selectedFilePath, setSelectedFilePath] = useState<string>('');
-  const [selectedFileCode, setSelectedFileCode] = useState<string>('');
-  const [isLoadingCode, setIsLoadingCode] = useState(false);
-  
-  // Code Range Selection States
-  const [startLineSelect, setStartLineSelect] = useState<number | null>(null);
-  const [endLineSelect, setEndLineSelect] = useState<number | null>(null);
-  const [selectedCodeSnippet, setSelectedCodeSnippet] = useState<string>('');
-
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const codeContainerRef = useRef<HTMLDivElement>(null);
-
-  const [repo, setRepo] = useState<any>(null);
-  const [isRetryingKb, setIsRetryingKb] = useState(false);
-
-  const handleRetryKb = async () => {
-    setIsRetryingKb(true);
-    try {
-      const res = await fetch(`${apiUrl}/repositories/${repoId}/knowledge/retry`, {
-        method: 'POST'
-      });
-      if (res.ok) {
-        const repoRes = await fetch(`${apiUrl}/repositories/${repoId}`);
-        if (repoRes.ok) setRepo(await repoRes.json());
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || 'Failed to trigger retry');
+  // Handle Escape key to close citation modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && selectedCitation) {
+        setSelectedCitation(null);
       }
-    } catch (err: any) {
-      alert(err.message || 'KB retry failed');
-    } finally {
-      setIsRetryingKb(false);
-    }
-  };
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedCitation]);
 
-  // 1. Initial Load: Expert Modes, Starters, Files List, and Session setup
+  // Initial load
   useEffect(() => {
     const initData = async () => {
       try {
-        // Fetch repository details first
         const repoRes = await fetch(`${apiUrl}/repositories/${repoId}`);
         if (!repoRes.ok) throw new Error('Repository details not found.');
         const repoData = await repoRes.json();
         setRepo(repoData);
 
-        const isUnlocked = repoData.status === 'ready' && repoData.knowledge_status === 'completed';
-
-        if (!isUnlocked) {
-          setIsLoadingHistory(false);
-          return;
-        }
-
-        // Load modes
-        const modesRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/expert-modes`);
-        if (modesRes.ok) setExpertModes(await modesRes.json());
-
-        // Load starters
+        // Fetch starter questions
         const startersRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/starter-questions`);
-        if (startersRes.ok) setStarterQuestions(await startersRes.json());
-
-        // Load lessons
-        const lessonsRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/walkthrough`);
-        if (lessonsRes.ok) setLessons(await lessonsRes.json());
-
-        // Load files list for selection
-        const filesRes = await fetch(`${apiUrl}/repositories/${repoId}/files?limit=200`);
-        if (filesRes.ok) {
-          const filesData = await filesRes.json();
-          setFilesList(filesData.files.map((f: any) => ({ id: f.id, path: f.path })));
+        if (startersRes.ok) {
+          const s = await startersRes.json();
+          setStarterQuestions(s);
         }
 
         // Establish Chat Session
@@ -196,67 +116,48 @@ export default function RepositoryExpert({ params }: { params: { id: string } })
           await createNewSession();
         }
       } catch (err) {
-        console.error('Failed to configure chatbot presets:', err);
+        console.error('Failed to configure mentor chat:', err);
         setIsLoadingHistory(false);
       }
     };
     initData();
   }, [repoId, apiUrl]);
 
-  // Polling setup for active indexing
-  useEffect(() => {
-    if (repo && (repo.knowledge_status !== 'completed' || repo.status !== 'ready')) {
-      const interval = setInterval(async () => {
-        const repoRes = await fetch(`${apiUrl}/repositories/${repoId}`);
-        if (repoRes.ok) {
-          const repoData = await repoRes.json();
-          setRepo(repoData);
-          if (repoData.status === 'ready' && repoData.knowledge_status === 'completed') {
-            clearInterval(interval);
-            // Re-run setup
-            const reloadSetup = async () => {
-              try {
-                const modesRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/expert-modes`);
-                if (modesRes.ok) setExpertModes(await modesRes.json());
-                const startersRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/starter-questions`);
-                if (startersRes.ok) setStarterQuestions(await startersRes.json());
-                const lessonsRes = await fetch(`${apiUrl}/repositories/${repoId}/chat/walkthrough`);
-                if (lessonsRes.ok) setLessons(await lessonsRes.json());
-                const filesRes = await fetch(`${apiUrl}/repositories/${repoId}/files?limit=200`);
-                if (filesRes.ok) {
-                  const filesData = await filesRes.json();
-                  setFilesList(filesData.files.map((f: any) => ({ id: f.id, path: f.path })));
-                }
-                const cachedSession = localStorage.getItem(`chat_session_${repoId}`);
-                if (cachedSession) {
-                  setSessionId(cachedSession);
-                  fetchHistory(cachedSession);
-                } else {
-                  await createNewSession();
-                }
-              } catch (e) {
-                console.error(e);
-              }
-            };
-            reloadSetup();
-          }
-        }
-      }, 5000);
-      return () => clearInterval(interval);
-    }
-  }, [repo, repoId, apiUrl]);
-
   // Scroll to chat bottom
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, streamingResponse]);
+
+  // Poll repository status while background indexing is in progress
+  useEffect(() => {
+    const isIndexing = repo?.knowledge_status === 'indexing' || 
+      (repo?.knowledge_summary?.chat_index_progress !== undefined && repo.knowledge_summary.chat_index_progress < 100);
+      
+    if (isIndexing) {
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch(`${apiUrl}/repositories/${repoId}`);
+          if (res.ok) {
+            const data = await res.json();
+            setRepo(data);
+            if (data?.knowledge_summary?.chat_index_progress >= 100 || data?.knowledge_status === 'completed') {
+              clearInterval(interval);
+            }
+          }
+        } catch (e) {
+          // ignore transient poll error
+        }
+      }, 2500);
+      return () => clearInterval(interval);
+    }
+  }, [repo?.knowledge_status, repo?.knowledge_summary?.chat_index_progress, repoId, apiUrl]);
 
   const createNewSession = async () => {
     setIsLoadingHistory(true);
     try {
       const res = await fetch(`${apiUrl}/repositories/${repoId}/chat/sessions`, { method: 'POST' });
       if (res.ok) {
-        const data: ChatSessionResponse = await res.json();
+        const data = await res.json();
         setSessionId(data.session_id);
         localStorage.setItem(`chat_session_${repoId}`, data.session_id);
         setMessages([]);
@@ -282,117 +183,137 @@ export default function RepositoryExpert({ params }: { params: { id: string } })
     }
   };
 
-  // 2. Fetch File Source Code Content
-  const fetchFileContent = async (fileId: string, filePath: string) => {
-    setIsLoadingCode(true);
-    setSelectedFileId(fileId);
-    setSelectedFilePath(filePath);
-    setStartLineSelect(null);
-    setEndLineSelect(null);
-    setSelectedCodeSnippet('');
+  const handleCancel = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsSending(false);
+    setStreamStage('idle');
+  };
+
+  const handleReindexCode = async () => {
+    setIsReindexing(true);
     try {
-      const res = await fetch(`${apiUrl}/repositories/${repoId}/files/${fileId}/content`);
+      const res = await fetch(`${apiUrl}/repositories/${repoId}/knowledge/retry`, {
+        method: 'POST'
+      });
       if (res.ok) {
-        const data = await res.json();
-        setSelectedFileCode(data.content);
+        toast.success('Knowledge Base indexing triggered. Polling progress...');
+        const repoRes = await fetch(`${apiUrl}/repositories/${repoId}`);
+        if (repoRes.ok) {
+          const updated = await repoRes.json();
+          setRepo(updated);
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        toast.error(errData.detail || 'Failed to trigger Knowledge Base indexing.');
       }
-      setIsLoadingCode(false);
-    } catch (err) {
-      console.error(err);
-      setIsLoadingCode(false);
+    } catch (e: any) {
+      toast.error(e.message || 'Error communicating with server.');
+    } finally {
+      setIsReindexing(false);
     }
   };
 
-  // Click on a line in code preview sets start/end range
-  const handleLineClick = (lineNum: number) => {
-    if (startLineSelect === null) {
-      setStartLineSelect(lineNum);
-      setEndLineSelect(lineNum);
-    } else if (lineNum < startLineSelect) {
-      setStartLineSelect(lineNum);
-    } else {
-      setEndLineSelect(lineNum);
-    }
-  };
+  const handleSendMessage = async (textToSend?: string, isAutoRetry: boolean = false) => {
+    if (isSending && !isAutoRetry) return; // Guard duplicate submissions
 
-  // Update selected code snippet based on selected line bounds
-  useEffect(() => {
-    if (startLineSelect === null || endLineSelect === null || !selectedFileCode) {
-      setSelectedCodeSnippet('');
-      return;
-    }
-    const lines = selectedFileCode.split('\n');
-    const slice = lines.slice(startLineSelect - 1, endLineSelect);
-    setSelectedCodeSnippet(slice.join('\n'));
-  }, [startLineSelect, endLineSelect, selectedFileCode]);
-
-  // Inject selected code range into the chat input
-  const handleInjectSelection = (action: string) => {
-    if (!selectedCodeSnippet) return;
-    const prompt = (
-      `${action} in file \`${selectedFilePath}\` (lines ${startLineSelect}-${endLineSelect}):\n` +
-      `\`\`\`\n${selectedCodeSnippet}\n\`\`\``
-    );
-    setInputText(prompt);
-  };
-
-  // Clear selections
-  const clearSelection = () => {
-    setStartLineSelect(null);
-    setEndLineSelect(null);
-    setSelectedCodeSnippet('');
-  };
-
-  // 3. Send Message via Server-Sent Events (SSE) Streaming
-  const handleSendMessage = async (textToSend?: string) => {
     const text = (textToSend || inputText).trim();
     if (!text || !sessionId) return;
 
+    lastSubmittedTextRef.current = text;
     setInputText('');
+    setActiveError(null);
     setIsSending(true);
+    setStreamStage('searching');
     setStreamingResponse('');
     setStreamingCitations([]);
-    setStreamingConfidence(null);
-    setStreamingSteps([]);
-    setStreamingFollowUp([]);
 
-    // Add user message locally
-    const userMsg: Message = {
-      id: Math.random().toString(36).substring(2, 9),
-      role: 'user',
-      content: text,
-      expert_mode: expertMode,
-      created_at: new Date().toISOString()
-    };
-    setMessages(prev => [...prev, userMsg]);
+    // Add user message locally only if not an automatic retry
+    if (!isAutoRetry) {
+      const userMsg: Message = {
+        id: Math.random().toString(36).substring(2, 9),
+        role: 'user',
+        content: text,
+        created_at: new Date().toISOString()
+      };
+      setMessages(prev => [...prev, userMsg]);
+      trackMentorQuerySent(repoId, false);
+    }
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     try {
-      // Initiate HTTP request
       const response = await fetch(`${apiUrl}/repositories/${repoId}/chat/sessions/${sessionId}/messages`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content: text,
-          expert_mode: expertMode,
-          explain_mode: explainMode
-        })
+          expert_mode: 'General',
+          explain_mode: 'Senior Engineer'
+        }),
+        signal: abortController.signal
       });
+
+      if (!response.ok) {
+        let errMsg = `Mentor request failed with status ${response.status}.`;
+        let retryable = true;
+        try {
+          const errJson = await response.json();
+          if (errJson.detail) errMsg = errJson.detail;
+        } catch (_) {}
+
+        if (response.status === 429) {
+          const retryHeader = response.headers.get('Retry-After');
+          const waitSec = retryHeader ? Math.min(6, parseInt(retryHeader, 10)) : 2;
+          if (!isAutoRetry) {
+            // Automatic retry once on 429 after waiting Retry-After
+            setActiveError({
+              code: 429,
+              message: `Rate limit reached (HTTP 429). Waiting for Retry-After and retrying automatically in ${waitSec}s...`,
+              retryable: false,
+              submittedText: text
+            });
+            setTimeout(() => {
+              handleSendMessage(text, true);
+            }, waitSec * 1000);
+            return;
+          }
+          errMsg = "LLM rate limit reached (HTTP 429). Please wait a moment and click Retry.";
+        } else if (response.status === 500) {
+          errMsg = "Internal Server Error (HTTP 500): The server encountered an error processing repository analysis facts. Please click Retry.";
+        } else if (response.status === 503 || response.status === 504) {
+          errMsg = "Request Timed Out (HTTP 504): The LLM or database connection took too long to respond. Please click Retry.";
+        }
+
+        setActiveError({
+          code: response.status,
+          message: errMsg,
+          retryable: retryable,
+          submittedText: text
+        });
+        setInputText(text); // Preserve submitted question in input box
+        setStreamStage('error');
+        setIsSending(false);
+        return;
+      }
 
       if (!response.body) throw new Error('ReadableStream not supported.');
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let tokensReceived = 0;
+      let lastModelUsed = '';
+      let isIncomplete = false;
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        
-        // Save the incomplete line back to buffer
+        const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || '';
 
         for (const line of lines) {
@@ -400,178 +321,95 @@ export default function RepositoryExpert({ params }: { params: { id: string } })
             const dataStr = line.slice(6).trim();
             try {
               const payload = JSON.parse(dataStr);
-              if (payload.type === 'token') {
+              if (payload.type === 'status') {
+                if (payload.stage === 'synthesizing') {
+                  setStreamStage('writing');
+                } else if (payload.stage === 'retrieving') {
+                  setStreamStage('searching');
+                } else {
+                  setStreamStage(payload.stage || 'streaming');
+                }
+              } else if (payload.type === 'token') {
+                tokensReceived++;
+                setStreamStage('streaming');
                 setStreamingResponse(prev => prev + payload.token);
               } else if (payload.type === 'metadata') {
                 setStreamingCitations(payload.citations || []);
-                setStreamingConfidence(payload.confidence);
-                setStreamingSteps(payload.steps || []);
-                setStreamingFollowUp(payload.follow_up || []);
+                if (payload.model_used) lastModelUsed = payload.model_used;
+                if (payload.code_index_incomplete) isIncomplete = true;
+              } else if (payload.type === 'error') {
+                if (payload.code === 429 && !isAutoRetry) {
+                  const waitSec = payload.retry_after ? Math.min(6, Math.ceil(payload.retry_after)) : 2;
+                  setActiveError({
+                    code: 429,
+                    message: `Rate limit reached (429). Retrying automatically in ${waitSec}s...`,
+                    retryable: false,
+                    submittedText: text
+                  });
+                  setTimeout(() => {
+                    handleSendMessage(text, true);
+                  }, waitSec * 1000);
+                  return;
+                }
+                setActiveError({
+                  code: payload.code,
+                  message: payload.message || 'Stream was interrupted by provider.',
+                  retryable: payload.retryable ?? true,
+                  retryAfter: payload.retry_after,
+                  submittedText: text
+                });
+                setStreamStage('error');
+                if (tokensReceived === 0) {
+                  setInputText(text); // Preserve question
+                }
+                break;
               }
             } catch (jsonErr) {
-              // ignore parse errors on incomplete chunk lines
+              // ignore incomplete JSON chunk
             }
           }
         }
       }
 
-      // Re-fetch message history to keep sync with DB
       fetchHistory(sessionId);
       setIsSending(false);
-    } catch (err) {
-      console.error(err);
+      setStreamStage('idle');
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // User voluntarily cancelled stream
+        setStreamStage('idle');
+        setIsSending(false);
+        return;
+      }
+      console.error('Mentor request failure:', err);
+      const isTimeout = err.name === 'TimeoutError' || err.message?.includes('timed out');
+      setActiveError({
+        code: isTimeout ? 504 : 0,
+        message: isTimeout
+          ? 'Request timed out: The mentor did not answer within the allowed time. Please click Retry.'
+          : 'Network Connection Lost: Unable to connect to RepoMentor backend. Please check your network and click Retry.',
+        retryable: true,
+        submittedText: text
+      });
+      setInputText(text); // Preserve submitted question
+      setStreamStage('error');
       setIsSending(false);
+    } finally {
+      abortControllerRef.current = null;
     }
   };
 
-  const activeExpertPrompt = expertModes.find(m => m.mode === expertMode)?.description || 'General mode';
+  const defaultChips = [
+    'Explain the overall project architecture',
+    'Where is authentication handled?',
+    'What should I refactor first?',
+    'Identify potential security risks',
+  ];
 
-  // 1. Ingestion Pipeline Active
-  if (repo && repo.status !== 'ready') {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-bgPrimary text-textPrimary font-sans">
-        <div className="max-w-md w-full p-6 bg-bgSecondary border border-borderPrimary rounded-2xl space-y-6 shadow-md">
-          <div className="text-center space-y-2">
-            <Loader2 className="w-8 h-8 animate-spin text-brand-500 mx-auto" />
-            <h2 className="text-sm font-bold text-textPrimary uppercase tracking-wider">Repository Ingestion Active</h2>
-            <p className="text-xs text-textSecondary">Deterministic scanning and analysis are running...</p>
-          </div>
-          
-          <div className="bg-slate-50 dark:bg-zinc-950 border border-slate-200 dark:border-zinc-950 p-4 rounded-xl space-y-3 text-xs">
-            {(() => {
-              const stageList = [
-                { key: 'clone', label: 'Clone Repository' },
-                { key: 'parse', label: 'Scan Project Files' },
-                { key: 'tech_detect', label: 'Detect Technologies' },
-                { key: 'metrics', label: 'Calculate Code Metrics' },
-                { key: 'architecture', label: 'Analyze Architecture & Imports' },
-                { key: 'security', label: 'Perform Security Vulnerability Review' }
-              ];
-              
-              return stageList.map((stg) => {
-                const info = repo.progress?.[stg.key] || { status: 'pending' };
-                const isCompleted = info.status === 'completed';
-                const isRunning = info.status === 'running';
-                
-                return (
-                  <div key={stg.key} className="flex items-center gap-3">
-                    {isCompleted ? (
-                      <CheckCircle className="w-4 h-4 text-emerald-500" />
-                    ) : isRunning ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-brand-500" />
-                    ) : (
-                      <div className="w-4 h-4 rounded-full border border-slate-300 dark:border-gray-800" />
-                    )}
-                    <span className={isCompleted ? 'text-textSecondary' : isRunning ? 'text-textPrimary font-semibold' : 'text-slate-400 dark:text-gray-600'}>
-                      {stg.label}
-                    </span>
-                  </div>
-                );
-              });
-            })()}
-          </div>
-          <button
-            onClick={() => router.push(`/repositories/${repoId}`)}
-            className="w-full py-2.5 px-4 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-800 text-textPrimary rounded-xl text-xs font-semibold transition-all"
-          >
-            Back to Overview
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // 2. Knowledge Indexing in Progress (Component 4)
-  // 2. Indexing / Processing State
-  const pct = (() => {
-    if (!repo?.status_message) return 0;
-    const match = repo.status_message.match(/(\d+)%\s+complete/);
-    return match ? parseInt(match[1]) : 0;
-  })();
-
-  if (repo && (repo.knowledge_status === 'pending' || repo.knowledge_status === 'indexing')) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-bgPrimary px-4 font-sans text-center text-textPrimary">
-        <div className="max-w-md w-full bg-bgSecondary border border-borderPrimary p-8 rounded-2xl shadow-sm space-y-6">
-          <Loader2 className="w-10 h-10 animate-spin text-brand-500 mx-auto" />
-          <div className="space-y-2">
-            <h2 className="text-lg font-bold text-textPrimary tracking-tight">AI Indexing Active</h2>
-            <p className="text-xs text-textSecondary">
-              The vector knowledge index is currently compiling. The AI Mentor chat interface will unlock immediately after vector indexing completes.
-            </p>
-          </div>
-          <div className="bg-slate-50 dark:bg-zinc-950/40 border border-slate-200 dark:border-zinc-900/60 p-4 rounded-xl text-xs space-y-2 text-left">
-            <div className="flex justify-between items-center text-textSecondary">
-              <span>Knowledge Base Indexing</span>
-              <span className="text-[10px] text-brand-600 dark:text-brand-400 font-bold uppercase tracking-wider animate-pulse">Running</span>
-            </div>
-            <div className="flex justify-between items-center text-slate-400 dark:text-gray-500">
-              <span>AI Chat Initialization</span>
-              <span>Pending</span>
-            </div>
-          </div>
-          <p className="text-[10px] text-textSecondary font-mono">Current Stage: {repo.status_message || 'Indexing'}</p>
-          <div className="flex gap-2">
-            <button
-              onClick={() => router.push(`/repositories/${repoId}`)}
-              className="w-full py-2.5 px-4 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-800 text-textPrimary rounded-xl text-xs font-semibold transition-all"
-            >
-              Back to Overview
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 3. Knowledge Indexing Failed (Component 8 & Retry options)
-  if (repo && (repo.knowledge_status === 'failed' || repo.knowledge_status === 'interrupted')) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-bgPrimary px-4 font-sans text-center text-textPrimary">
-        <div className="max-w-md w-full bg-bgSecondary border border-rose-500/20 p-8 rounded-2xl shadow-md space-y-6">
-          <AlertTriangle className="w-10 h-10 text-rose-500 mx-auto" />
-          <div className="space-y-2">
-            <h2 className="text-lg font-bold text-textPrimary tracking-tight">AI Indexing Failed</h2>
-            <p className="text-xs text-textSecondary text-left">
-              The AI Knowledge Base indexing could not be completed. Vector query is unavailable. Please click below to retry indexing.
-            </p>
-          </div>
-          <div className="bg-slate-50 dark:bg-zinc-950 border border-rose-500/10 p-4 rounded-xl text-left">
-            <span className="text-textSecondary font-bold block mb-1 text-[10px]">Error Details:</span>
-            <p className="text-rose-500 dark:text-rose-400 font-mono text-[10px] leading-relaxed break-all">
-              {repo.error_message || 'Timeout exceeded during embedding generation.'}
-            </p>
-          </div>
-          <div className="flex gap-3">
-            <button
-              onClick={() => router.push(`/repositories/${repoId}`)}
-              className="flex-1 py-2.5 px-4 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-800 text-textPrimary rounded-xl text-xs font-semibold transition-all"
-            >
-              Back to Overview
-            </button>
-            <button
-              disabled={isRetryingKb}
-              onClick={handleRetryKb}
-              className="flex-1 py-2.5 px-4 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5"
-            >
-              {isRetryingKb && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-              Retry Indexing
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const displayChips = starterQuestions.length > 0 ? starterQuestions.slice(0, 4) : defaultChips;
 
   return (
-    <div className="min-h-screen bg-bgPrimary text-textPrimary flex flex-col font-sans selection:bg-brand-500/20 relative overflow-hidden transition-colors duration-300">
-      {/* Background radial/linear glow elements */}
-      <div className="absolute top-0 left-1/4 w-96 h-96 bg-brand-500/5 rounded-full blur-[120px] pointer-events-none -z-10 animate-slow-blob-1" />
-      <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-indigo-500/5 rounded-full blur-[100px] pointer-events-none -z-10 animate-slow-blob-2" />
-      
-      {/* Grid Overlay */}
-      <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(99,102,241,0.02)_1px,transparent_1px),linear-gradient(to_bottom,rgba(99,102,241,0.02)_1px,transparent_1px)] bg-[size:3.5rem_3.5rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_50%,#000_70%,transparent_100%)] -z-10" />
-
+    <div className="min-h-screen bg-bgPrimary text-textPrimary flex flex-col font-sans transition-colors duration-200">
       <Header 
         repoId={repoId} 
         repoUrl={repo?.url || ''} 
@@ -579,282 +417,350 @@ export default function RepositoryExpert({ params }: { params: { id: string } })
         activeTab="mentor" 
       />
 
-      {/* Main split dashboard layout */}
-      <div className="flex-grow flex flex-col lg:flex-row h-[calc(100vh-68px)] mt-[68px] overflow-hidden">
+      <div className="flex-grow flex flex-col max-w-5xl w-full mx-auto px-4 sm:px-6 pt-[76px] pb-6 h-[calc(100vh-20px)]">
         
-        {/* ==========================================
-            LEFT PANEL: CHAT INTERFACE & INPUT
-           ========================================== */}
-        <div className="w-full flex flex-col h-full bg-slate-50/5 dark:bg-zinc-950/20">
-          
-          {/* Header toolbar */}
-          <div className="px-6 py-4 border-b border-borderPrimary flex items-center justify-between gap-4">
+        {/* Editorial Subheader */}
+        <div className="py-3 border-b border-borderPrimary flex items-center justify-between text-xs font-mono">
+          <div className="flex items-center gap-2">
+            <span className="section-header">CONSULTATION // CODEBASE MENTOR</span>
+            <span className="text-textMuted">•</span>
+            <span className="text-textSecondary">Evidence-Grounded RAG</span>
+            {repo?.knowledge_status === 'failed' ? (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono border border-bad/40 bg-bad/10 text-bad font-bold">
+                <ShieldAlert className="w-2.5 h-2.5" />
+                Index Failed: {repo?.knowledge_summary?.failure_stage || 'Error'}
+              </span>
+            ) : repo?.knowledge_summary?.chat_index_progress !== undefined && repo.knowledge_summary.chat_index_progress < 100 ? (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono border border-signal/40 bg-signal/10 text-signal">
+                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                Chat index: {repo.knowledge_summary.chat_index_progress}%
+              </span>
+            ) : null}
+          </div>
+          <button
+            onClick={createNewSession}
+            className="text-textSecondary hover:text-signal text-[11px] underline underline-offset-2 transition-colors"
+          >
+            Clear conversation
+          </button>
+        </div>
+
+        {repo?.knowledge_status === 'failed' && (
+          <div className="p-3 my-3 bg-bad/10 border border-bad/30 rounded text-bad text-xs font-mono flex items-start gap-2">
+            <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5 text-bad" />
             <div>
-              <h2 className="text-sm font-bold text-textPrimary flex items-center gap-1.5">
-                <Sparkles className="w-4 h-4 text-brand-600 dark:text-violet-400 animate-spin-slow" /> AI Repository Mentor
-              </h2>
-              <span className="text-[10px] text-textSecondary font-medium">Fully Grounded Evidence chatbot</span>
+              <strong className="font-bold">Knowledge Build Failed:</strong> Stage: {repo?.knowledge_summary?.failure_stage || 'Unknown'}, Reason: {repo?.knowledge_summary?.failure_reason || repo?.error_message || 'Unexpected failure'}
             </div>
           </div>
+        )}
 
-          {/* Messages stream viewport */}
-          <div className="flex-grow overflow-y-auto px-6 py-6 space-y-6 animate-fade-in">
+        {/* Message Thread Viewport */}
+        <div className="flex-grow overflow-y-auto py-6 space-y-6">
+          {isLoadingHistory ? (
+            <div className="space-y-4 max-w-xl mx-auto py-8">
+              <div className="h-10 bg-bgSecondary border border-borderPrimary rounded animate-pulse" />
+              <div className="h-24 bg-bgSecondary border border-borderPrimary rounded animate-pulse" />
+            </div>
+          ) : messages.length === 0 && !streamingResponse ? (
+            /* Empty State: Starter Question Chips */
+            <div className="max-w-2xl mx-auto py-12 text-center space-y-6">
+              <div className="space-y-2">
+                <div className="w-10 h-10 rounded-full border border-signal/30 bg-signal/10 flex items-center justify-center mx-auto text-signal">
+                  <Sparkles className="w-5 h-5" />
+                </div>
+                <h2 className="font-serif text-2xl font-bold text-textPrimary">
+                  Ask Your Repository Mentor
+                </h2>
+                <p className="text-xs text-textSecondary font-sans max-w-md mx-auto leading-relaxed">
+                  Every answer is strictly grounded in the parsed AST, dependency imports, and code smell analysis of this repository.
+                </p>
+              </div>
 
-            {isLoadingHistory ? (
-              <div className="h-full flex items-center justify-center">
-                <div className="text-center space-y-4">
-                  <Loader2 className="w-6 h-6 animate-spin text-brand-500 mx-auto" />
-                  <p className="text-xs text-textSecondary">Loading conversation session...</p>
+              {/* Suggested Question Chips */}
+              <div className="space-y-2 max-w-xl mx-auto text-left">
+                <span className="section-header block text-center">RECOMMENDED INQUIRIES</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                  {displayChips.map((chip, i) => (
+                    <button
+                      key={i}
+                      onClick={() => handleSendMessage(chip)}
+                      className="p-3 rounded border border-borderPrimary bg-bgSecondary hover:border-signal text-textSecondary hover:text-textPrimary transition-all text-left flex items-start justify-between gap-2 shadow-sm group"
+                    >
+                      <span className="line-clamp-2">{chip}</span>
+                      <ArrowUpRight className="w-3.5 h-3.5 text-textMuted group-hover:text-signal shrink-0 mt-0.5" />
+                    </button>
+                  ))}
                 </div>
               </div>
-            ) : (
-              <>
-                {messages.length === 0 && !streamingResponse && (
-                  <div className="max-w-xl mx-auto space-y-6 py-6">
-                    <div className="p-5 bg-bgSecondary border border-borderPrimary rounded-2xl space-y-2 shadow-sm">
-                      <h3 className="text-xs font-bold text-textSecondary uppercase tracking-wider flex items-center gap-1.5">
-                        <Cpu className="w-4 h-4 text-brand-500 dark:text-violet-400" /> AI Repository Mentor
-                      </h3>
-                      <p className="text-xs text-textSecondary leading-relaxed font-medium">
-                        Ask any questions about the files, classes, architecture, security, or algorithms in this repository. All answers are grounded in codebase evidence.
-                      </p>
-                    </div>
-
-                    <div className="space-y-3">
-                      <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wider block">Starter Prompts:</span>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                        {starterQuestions.map((q, i) => (
-                          <button
-                            key={i}
-                            onClick={() => handleSendMessage(q)}
-                            className="p-3 bg-slate-50 dark:bg-zinc-950/60 border border-slate-200 dark:border-zinc-900 hover:border-slate-300 dark:hover:border-zinc-800 text-left rounded-xl text-textSecondary hover:text-textPrimary transition-all leading-relaxed"
-                          >
-                            {q}
-                          </button>
-                        ))}
+            </div>
+          ) : (
+            <>
+              {/* Render Existing Messages */}
+              {messages.map((m) => {
+                const isUser = m.role === 'user';
+                return (
+                  <div key={m.id} className={`flex gap-3 ${isUser ? 'justify-end' : 'justify-start'}`}>
+                    {!isUser && (
+                      <div className="w-7 h-7 rounded border border-borderPrimary bg-bgSecondary flex items-center justify-center text-signal shrink-0 mt-0.5 shadow-sm">
+                        <Terminal className="w-3.5 h-3.5" />
                       </div>
-                    </div>
-                  </div>
-                )}
+                    )}
 
-                {/* Messages list */}
-                {messages.map((m) => {
-                  const isUser = m.role === 'user';
-                  const isSummary = m.role === 'summary';
-                  
-                  if (isSummary) {
-                    return (
-                      <div key={m.id} className="max-w-md mx-auto p-3 bg-brand-500/5 border border-brand-500/10 rounded-xl text-center text-[10px] text-brand-600 dark:text-violet-300 font-medium">
-                        Conversation Summarized: "{m.content}"
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div key={m.id} className={`flex gap-4 ${isUser ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`w-8 h-8 rounded-xl shrink-0 flex items-center justify-center border ${
-                        isUser ? 'bg-brand-500/10 border-brand-500/20 text-brand-600 dark:text-brand-300' : 'bg-violet-500/10 border-violet-500/20 text-violet-600 dark:text-violet-300'
+                    <div className={`space-y-2 max-w-[85%] sm:max-w-[78%] ${isUser ? 'items-end' : 'items-start'}`}>
+                      <div className={`p-4 sm:p-5 rounded-lg border text-xs sm:text-sm leading-relaxed ${
+                        isUser
+                          ? 'bg-signal/5 border-signal/20 text-textPrimary'
+                          : 'bg-bgSecondary border-borderPrimary text-textPrimary shadow-report'
                       }`}>
-                        {isUser ? <User className="w-4 h-4" /> : <Cpu className="w-4 h-4" />}
+                        {isUser ? (
+                          <p className="whitespace-pre-wrap font-sans">{m.content}</p>
+                        ) : (
+                          <>
+                            <MarkdownRenderer content={m.content} />
+                            {m.model_used && (
+                              <div className="pt-2 mt-2 border-t border-borderPrimary/40 flex items-center justify-between text-[10px] font-mono text-textMuted">
+                                <span>Answered by {m.model_used}</span>
+                                <span>Deterministic (temp: 0, seed: 42)</span>
+                              </div>
+                            )}
+                          </>
+                        )}
                       </div>
 
-                      <div className="space-y-3 max-w-[80%]">
-                        <div className={`p-4 rounded-2xl text-xs leading-relaxed border ${
-                          isUser
-                            ? 'bg-brand-500/5 border-brand-500/15 text-textPrimary rounded-tr-none'
-                            : 'bg-bgSecondary border-borderPrimary text-textPrimary rounded-tl-none'
-                        }`}>
-                          <pre className="whitespace-pre-wrap font-sans">{m.content}</pre>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-
-                {/* Streaming Assistant bubble */}
-                {isSending && streamingResponse && (
-                  <div className="flex gap-4 justify-start">
-                    <div className="w-8 h-8 rounded-xl shrink-0 flex items-center justify-center border bg-violet-500/10 border-violet-500/20 text-violet-650 dark:text-brand-300">
-                      <Cpu className="w-4 h-4" />
-                    </div>
-                    <div className="space-y-3 max-w-[80%]">
-                      <div className="p-4 rounded-2xl text-xs leading-relaxed border bg-bgSecondary border-borderPrimary text-textPrimary rounded-tl-none">
-                        <pre className="whitespace-pre-wrap font-sans">{streamingResponse}</pre>
-                      </div>
-
-                      {/* Follow-up Questions */}
-                      {streamingFollowUp.length > 0 && (
-                        <div className="space-y-1.5 pt-1 pl-2">
-                          <span className="text-[10px] text-textSecondary font-bold uppercase tracking-wider block">Suggested Questions:</span>
-                          <div className="flex flex-wrap gap-2">
-                            {streamingFollowUp.map((q, fIdx) => (
+                      {/* Evidence Citations Chips */}
+                      {m.cited_chunks && m.cited_chunks.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 pt-1 pl-1">
+                          <span className="text-[10px] font-mono text-textMuted uppercase font-bold">Evidence:</span>
+                          {m.cited_chunks.map((ch, cIdx) => {
+                            const isSummary = (ch as any).chunk_type?.toLowerCase() === 'evidence' || ch.file_path.startsWith('Repo summary:') || ch.file_path === 'Repository Summary';
+                            const displayName = isSummary ? ch.file_path : ch.file_path.split('/').pop();
+                            const hasLines = !isSummary && ch.line_numbers && ch.line_numbers !== '1-1';
+                            return (
                               <button
-                                key={fIdx}
-                                onClick={() => handleSendMessage(q)}
-                                className="px-2.5 py-1 border border-slate-200 dark:border-zinc-900 hover:border-brand-500/20 bg-slate-50 dark:bg-zinc-900/25 hover:bg-slate-100 dark:hover:bg-zinc-900/65 text-textSecondary hover:text-textPrimary text-[9px] rounded-lg transition-all"
+                                key={cIdx}
+                                onClick={() => setSelectedCitation(ch)}
+                                className="px-2 py-0.5 rounded border border-borderPrimary bg-bgSecondary hover:border-signal text-[10px] font-mono text-textSecondary hover:text-textPrimary transition-colors flex items-center gap-1"
+                                title={`Inspect source snippet in ${ch.file_path}`}
                               >
-                                {q}
+                                <FileCode className="w-3 h-3 text-signal" />
+                                <span>{displayName}</span>
+                                {hasLines && <span className="text-textMuted">L{ch.line_numbers}</span>}
                               </button>
-                            ))}
-                          </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* Incomplete Index Alert with Re-index Button */}
+                      {(m.content.includes("Code index is incomplete") || m.content.includes("Index incomplete") || m.content.includes("Index model mismatch") || m.code_index_incomplete) && (
+                        <div className="pt-2">
+                          <button
+                            type="button"
+                            onClick={handleReindexCode}
+                            disabled={isReindexing || repo?.knowledge_status === 'indexing'}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-signal/10 hover:bg-signal/20 text-signal border border-signal/30 rounded text-xs font-mono font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <RotateCw className={`w-3.5 h-3.5 ${isReindexing || repo?.knowledge_status === 'indexing' ? 'animate-spin' : ''}`} />
+                            <span>{isReindexing || repo?.knowledge_status === 'indexing' ? 'Indexing Code Chunks...' : 'Re-index Repository Code'}</span>
+                          </button>
                         </div>
                       )}
                     </div>
-                  </div>
-                )}
 
-                {isSending && !streamingResponse && (
-                  <div className="flex gap-4 justify-start">
-                    <div className="w-8 h-8 rounded-xl shrink-0 flex items-center justify-center border bg-violet-500/10 border-violet-500/20 text-violet-500 animate-pulse">
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                    {isUser && (
+                      <div className="w-7 h-7 rounded border border-borderPrimary bg-bgSecondary flex items-center justify-center text-textSecondary shrink-0 mt-0.5 shadow-sm">
+                        <User className="w-3.5 h-3.5" />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* Live Streaming Response */}
+              {isSending && (
+                <div className="flex gap-3 justify-start animate-fade-in">
+                  <div className="w-7 h-7 rounded border border-borderPrimary bg-bgSecondary flex items-center justify-center text-signal shrink-0 mt-0.5 shadow-sm">
+                    <Terminal className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="space-y-2 max-w-[85%] sm:max-w-[78%]">
+                    <div className="p-4 sm:p-5 rounded-lg border border-borderPrimary bg-bgSecondary text-textPrimary shadow-report">
+                      {streamingResponse ? (
+                        <MarkdownRenderer content={streamingResponse} />
+                      ) : (
+                        <div className="flex items-center gap-2 text-xs font-mono text-textSecondary">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-signal" />
+                          <span>
+                            {streamStage === 'searching' ? 'Searching the repository...' :
+                             streamStage === 'writing' ? 'Writing answer...' :
+                             'Searching the repository...'}
+                          </span>
+                        </div>
+                      )}
                     </div>
-                    <span className="text-xs text-textSecondary mt-2 italic">Mentor is searching repository evidence...</span>
+
+                    {/* Citations arriving while streaming */}
+                    {streamingCitations.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1 pl-1">
+                        <span className="text-[10px] font-mono text-textMuted uppercase font-bold">Evidence:</span>
+                        {streamingCitations.map((ch, cIdx) => {
+                          const isSummary = (ch as any).chunk_type?.toLowerCase() === 'evidence' || ch.file_path.startsWith('Repo summary:') || ch.file_path === 'Repository Summary';
+                          const displayName = isSummary ? ch.file_path : ch.file_path.split('/').pop();
+                          return (
+                            <button
+                              key={cIdx}
+                              onClick={() => setSelectedCitation(ch)}
+                              className="px-2 py-0.5 rounded border border-borderPrimary bg-bgSecondary text-[10px] font-mono text-textSecondary flex items-center gap-1"
+                            >
+                              <FileCode className="w-3 h-3 text-signal" />
+                              <span>{displayName}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
-                )}
-              </>
-            )}
+                </div>
+              )}
+            </>
+          )}
 
-            <div ref={chatEndRef} />
-          </div>
+          <div ref={chatEndRef} />
+        </div>
 
-          {/* Chat input form */}
-          <div className="p-4 border-t border-borderPrimary bg-slate-100/50 dark:bg-zinc-950/40">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                placeholder="Ask about classes, interfaces, patterns, or architecture..."
-                className="flex-grow bg-bgPrimary border border-slate-200 dark:border-zinc-900 focus:border-brand-500 rounded-xl px-4 py-2.5 text-xs text-textPrimary placeholder-slate-400 dark:placeholder-gray-600 focus:ring-0 outline-none"
-                value={inputText}
-                onChange={e => setInputText(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') handleSendMessage();
-                }}
-              />
+        {/* Suggested Chips Bar (Always visible above input when thread exists) */}
+        {messages.length > 0 && !isSending && (
+          <div className="py-2 flex items-center gap-2 overflow-x-auto text-[11px] font-mono">
+            <span className="text-textMuted shrink-0">Quick prompts:</span>
+            {defaultChips.map((chip, i) => (
               <button
-                disabled={isSending || !inputText.trim()}
-                onClick={() => handleSendMessage()}
-                className="px-4 py-2.5 bg-brand-500 hover:bg-brand-600 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl text-white text-xs font-semibold flex items-center gap-1.5 transition-all shadow-lg"
+                key={i}
+                onClick={() => handleSendMessage(chip)}
+                className="px-2.5 py-1 rounded border border-borderPrimary bg-bgSecondary hover:border-signal text-textSecondary hover:text-textPrimary whitespace-nowrap transition-colors"
               >
-                <Send className="w-3.5 h-3.5" />
+                {chip}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Active Error / Retry Banner */}
+        {activeError && (
+          <div className="p-3 my-2 bg-bad/10 border border-bad/30 rounded-lg text-bad text-xs font-mono flex items-center justify-between gap-3 animate-fade-in shadow-sm">
+            <div className="flex items-center gap-2 overflow-hidden">
+              <AlertCircle className="w-4 h-4 shrink-0 text-bad" />
+              <span className="truncate">{activeError.message}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {activeError.retryable && (
+                <button
+                  type="button"
+                  onClick={() => handleSendMessage(activeError.submittedText)}
+                  className="px-2.5 py-1 bg-bad/20 hover:bg-bad/30 text-bad border border-bad/40 rounded flex items-center gap-1 transition-colors text-[11px] font-bold"
+                  title="Retry previous query"
+                >
+                  <RotateCw className="w-3 h-3" />
+                  <span>Retry</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setActiveError(null)}
+                className="text-textMuted hover:text-textPrimary p-1 rounded transition-colors"
+                title="Dismiss error"
+              >
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
+        )}
+
+        {/* Input Form Bar */}
+        <div className="pt-2 border-t border-borderPrimary">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSendMessage();
+            }}
+            className="flex items-center gap-2 bg-bgSecondary border border-borderPrimary rounded-lg p-2 shadow-sm focus-within:border-signal transition-colors"
+          >
+            <input
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              placeholder="Ask about design patterns, classes, smells, or security..."
+              disabled={isSending}
+              className="flex-grow bg-transparent px-3 py-1.5 text-xs sm:text-sm font-sans text-textPrimary placeholder:text-textMuted focus:outline-none"
+            />
+            {isSending ? (
+              <button
+                type="button"
+                onClick={handleCancel}
+                className="px-4 py-2 bg-bad/15 hover:bg-bad/25 text-bad border border-bad/30 rounded text-xs font-mono font-bold flex items-center gap-1.5 transition-colors shadow-sm"
+                aria-label="Stop generation"
+                title="Stop generation"
+              >
+                <Square className="w-3 h-3 fill-current" />
+                <span>Stop</span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={isSending || !inputText.trim()}
+                className="px-4 py-2 bg-signal hover:bg-signal-hover disabled:opacity-30 disabled:cursor-not-allowed rounded text-white text-xs font-mono font-bold flex items-center gap-1.5 transition-colors shadow-sm"
+                aria-label="Send query"
+              >
+                <Send className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Send</span>
+              </button>
+            )}
+          </form>
         </div>
 
       </div>
 
-      {/* ==========================================
-          MODAL: TEACH ME WALKTHROUGH MODAL
-         ========================================== */}
-      {isWalkthroughOpen && lessons.length > 0 && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fade-in">
-          <div className="bg-bgSecondary border border-borderPrimary rounded-3xl max-w-lg w-full overflow-hidden shadow-md animate-scale-up">
-            
-            {/* Modal Header */}
-            <div className="px-6 py-4 border-b border-borderPrimary flex justify-between items-center bg-slate-50/50 dark:bg-zinc-950/40">
-              <span className="text-xs font-bold text-textPrimary uppercase tracking-wider flex items-center gap-1.5 font-mono">
-                <BookOpen className="w-4 h-4 text-brand-500 dark:text-brand-400" /> Teach Me: Onboarding Walkthrough
-              </span>
+      {/* Citation Snippet Modal Overlay */}
+      {selectedCitation && (
+        <div 
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in"
+          onClick={() => setSelectedCitation(null)}
+        >
+          <div 
+            className="bg-bgSecondary border border-borderPrimary rounded-lg max-w-2xl w-full max-h-[85vh] flex flex-col p-6 shadow-report-lg space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-borderPrimary pb-3 shrink-0">
+              <div className="space-y-0.5">
+                <span className="section-header">GROUNDED EVIDENCE SNIPPET</span>
+                <h3 className="font-mono text-sm font-bold text-textPrimary">
+                  {selectedCitation.file_path} (Lines {selectedCitation.line_numbers})
+                </h3>
+              </div>
               <button
-                onClick={() => setIsWalkthroughOpen(false)}
-                className="text-slate-500 hover:text-slate-900 dark:text-gray-500 dark:hover:text-white p-1 hover:bg-slate-100 dark:hover:bg-gray-900 rounded-lg transition-colors"
+                onClick={() => setSelectedCitation(null)}
+                className="p-1 hover:bg-bgTertiary text-textSecondary rounded transition-colors"
+                aria-label="Close modal"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Slide content body */}
-            <div className="p-6 space-y-4">
-              <div className="space-y-2">
-                <span className="text-[10px] text-brand-600 dark:text-brand-400 uppercase font-bold tracking-wider font-mono">
-                  Lesson {lessons[activeLessonIdx].slide_index} of {lessons.length}
-                </span>
-                <h4 className="text-base font-bold text-textPrimary">
-                  {lessons[activeLessonIdx].title}
-                </h4>
-              </div>
-              
-              <div className="p-5 bg-slate-50 dark:bg-zinc-950/80 border border-slate-200 dark:border-gray-950 rounded-2xl text-xs text-textSecondary leading-relaxed font-medium min-h-[140px]">
-                {lessons[activeLessonIdx].content}
-              </div>
-            </div>
+            <pre className="p-4 bg-bgTertiary rounded border border-borderPrimary font-mono text-xs overflow-auto max-h-[55vh] text-textPrimary leading-relaxed">
+              <code>{selectedCitation.content}</code>
+            </pre>
 
-            {/* Modal Footer Controls */}
-            <div className="px-6 py-4 border-t border-borderPrimary bg-slate-50/50 dark:bg-zinc-950/40 flex justify-between items-center">
+            <div className="flex justify-between items-center text-xs font-mono text-textMuted pt-2 shrink-0 border-t border-borderPrimary/40">
+              <span>Similarity Score: {(selectedCitation.similarity_score * 100).toFixed(0)}%</span>
               <button
-                disabled={activeLessonIdx === 0}
-                onClick={() => setActiveLessonIdx(idx => idx - 1)}
-                className="px-3.5 py-2 border border-slate-200 dark:border-zinc-900 hover:border-slate-300 dark:hover:border-zinc-800 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-semibold rounded-xl text-textSecondary hover:text-textPrimary transition-all flex items-center gap-1"
+                onClick={() => setSelectedCitation(null)}
+                className="px-3 py-1 bg-bgTertiary border border-borderPrimary rounded hover:border-borderStrong text-textPrimary transition-colors"
               >
-                <ChevronLeft className="w-4 h-4" /> Previous
+                Close (Esc)
               </button>
-              
-              {activeLessonIdx === lessons.length - 1 ? (
-                <button
-                  onClick={() => setIsWalkthroughOpen(false)}
-                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition-all shadow-md"
-                >
-                  Finish Walkthrough
-                </button>
-              ) : (
-                <button
-                  onClick={() => setActiveLessonIdx(idx => idx + 1)}
-                  className="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-xs font-bold rounded-xl transition-all flex items-center gap-1 shadow-md"
-                >
-                  Next Lesson <ChevronRight className="w-4 h-4" />
-                </button>
-              )}
             </div>
-
           </div>
         </div>
       )}
 
-      {/* ==========================================
-          MODAL: INLINE CITATION SNIPPET OVERLAY
-         ========================================== */}
-      {citationModal.isOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fade-in">
-          <div className="bg-bgSecondary border border-borderPrimary rounded-2xl max-w-2xl w-full flex flex-col overflow-hidden shadow-md animate-scale-up">
-            
-            {/* Modal Header */}
-            <div className="px-6 py-4 border-b border-borderPrimary flex justify-between items-center bg-slate-50/50 dark:bg-[#0e111a]">
-              <div>
-                <h3 className="text-xs font-bold text-textPrimary font-mono truncate">{citationModal.filePath}</h3>
-                <span className="text-[9px] text-textSecondary font-mono">Lines {citationModal.lineNumbers}</span>
-              </div>
-              <button
-                onClick={() => setCitationModal(prev => ({ ...prev, isOpen: false }))}
-                className="text-slate-500 hover:text-slate-900 dark:text-zinc-400 dark:hover:text-white p-1 hover:bg-slate-100 dark:hover:bg-zinc-900 rounded-lg transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Modal Body */}
-            <div className="p-6 overflow-y-auto max-h-[60vh] bg-slate-50/20 dark:bg-[#07090e]">
-              <pre className="text-[11px] font-mono text-textPrimary whitespace-pre-wrap leading-relaxed bg-slate-100 dark:bg-[#0b0e16]/80 p-4 rounded-xl border border-borderPrimary overflow-x-auto">
-                {citationModal.content}
-              </pre>
-            </div>
-            
-            {/* Modal Footer */}
-            <div className="px-6 py-3 border-t border-borderPrimary bg-slate-50/50 dark:bg-[#0e111a] flex justify-end">
-              <button
-                onClick={() => setCitationModal(prev => ({ ...prev, isOpen: false }))}
-                className="px-4 py-1.5 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 text-textSecondary hover:text-textPrimary text-xs font-bold rounded-lg transition-colors"
-              >
-                Close
-              </button>
-            </div>
-
-          </div>
-        </div>
-      )}
-
-      <footer className="w-full text-center py-6 text-xs text-slate-500 dark:text-zinc-500 border-t border-slate-200 dark:border-zinc-900/40 mt-8 font-mono">
-        Repository Mentor AI &copy; {new Date().getFullYear()}
-      </footer>
     </div>
   );
 }
